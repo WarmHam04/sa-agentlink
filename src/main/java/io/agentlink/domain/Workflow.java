@@ -9,15 +9,30 @@ import java.util.Map;
 public final class Workflow {
     private final String contextId;
     private final String goal;
-    private final Instant createdAt = Instant.now();
+    private final Instant createdAt;
     private final Map<String, AgentTask> tasks;
 
     public Workflow(String contextId, String goal, List<TaskNodeSpec> nodes) {
+        this(contextId, goal, Instant.now(), createTasks(contextId, nodes));
+    }
+
+    private Workflow(String contextId, String goal, Instant createdAt, Map<String, AgentTask> tasks) {
         this.contextId = contextId;
         this.goal = goal;
+        this.createdAt = createdAt;
+        this.tasks = Map.copyOf(tasks);
+    }
+
+    public static Workflow restore(String contextId, String goal, Instant createdAt, List<AgentTask> tasks) {
+        Map<String, AgentTask> byNode = new LinkedHashMap<>();
+        tasks.forEach(task -> byNode.put(task.spec().nodeId(), task));
+        return new Workflow(contextId, goal, createdAt, byNode);
+    }
+
+    private static Map<String, AgentTask> createTasks(String contextId, List<TaskNodeSpec> nodes) {
         Map<String, AgentTask> byNode = new LinkedHashMap<>();
         nodes.forEach(node -> byNode.put(node.nodeId(), new AgentTask(contextId, node)));
-        this.tasks = Map.copyOf(byNode);
+        return byNode;
     }
 
     public String contextId() { return contextId; }

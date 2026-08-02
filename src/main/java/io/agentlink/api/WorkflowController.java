@@ -38,6 +38,11 @@ public class WorkflowController {
         return orchestrator.get(contextId);
     }
 
+    @PostMapping("/workflows/{contextId}:cancel")
+    public WorkflowView cancel(@PathVariable String contextId) {
+        return orchestrator.cancel(contextId);
+    }
+
     @GetMapping(value = "/contexts/{contextId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter events(
             @PathVariable String contextId,

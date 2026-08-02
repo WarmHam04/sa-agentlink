@@ -4,6 +4,7 @@ import io.agentlink.application.TaskEventBus;
 import io.agentlink.domain.TaskEvent;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -14,6 +15,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Component
+@ConditionalOnProperty(name = "agentlink.persistence.mode", havingValue = "memory", matchIfMissing = true)
 public class InMemoryTaskEventBus implements TaskEventBus {
     private final AtomicLong sequence = new AtomicLong();
     private final Map<String, CopyOnWriteArrayList<TaskEvent>> history = new ConcurrentHashMap<>();

@@ -8,14 +8,17 @@ import io.agentlink.application.WorkflowView;
 import io.agentlink.domain.TaskNodeSpec;
 import io.agentlink.domain.TaskState;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -23,21 +26,25 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 
 @RestController
 public class A2aServerController {
     private final WorkflowOrchestrator orchestrator;
     private final String publicBaseUrl;
     private final Duration blockingTimeout;
+    private final Executor streamExecutor;
 
     public A2aServerController(
             WorkflowOrchestrator orchestrator,
             @Value("${agentlink.a2a.public-base-url:http://localhost:8096}") String publicBaseUrl,
-            @Value("${agentlink.a2a.blocking-timeout:PT2M}") Duration blockingTimeout
+            @Value("${agentlink.a2a.blocking-timeout:PT2M}") Duration blockingTimeout,
+            @Qualifier("agentProcessExecutor") Executor streamExecutor
     ) {
         this.orchestrator = orchestrator;
         this.publicBaseUrl = publicBaseUrl.replaceAll("/+$", "");
         this.blockingTimeout = blockingTimeout;
+        this.streamExecutor = streamExecutor;
     }
 
     @GetMapping(value = "/.well-known/agent-card.json", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -50,7 +57,7 @@ public class A2aServerController {
                         "protocolBinding", "https://a2a-protocol.org/protocol-bindings/http+json",
                         "protocolVersion", "1.0"
                 )),
-                "capabilities", Map.of("streaming", false, "pushNotifications", false),
+                "capabilities", Map.of("streaming", true, "pushNotifications", false),
                 "defaultInputModes", List.of("text/plain"),
                 "defaultOutputModes", List.of("text/plain", "text/markdown"),
                 "skills", List.of(Map.of(
@@ -67,6 +74,35 @@ public class A2aServerController {
             produces = MediaType.APPLICATION_JSON_VALUE
     )
     public Map<String, Object> sendMessage(@RequestBody JsonNode request) {
+        WorkflowView workflow = createWorkflow(request);
+        boolean returnImmediately = request.path("configuration").path("returnImmediately").asBoolean(false);
+        WorkflowView response = returnImmediately ? workflow : awaitTerminal(workflow.contextId());
+        return toA2aTask(response);
+    }
+
+    @PostMapping(
+            value = "/a2a/message:stream",
+            consumes = {MediaType.APPLICATION_JSON_VALUE, "application/a2a+json"},
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE
+    )
+    public SseEmitter streamMessage(@RequestBody JsonNode request) {
+        WorkflowView workflow = createWorkflow(request);
+        SseEmitter emitter = new SseEmitter(blockingTimeout.toMillis());
+        streamExecutor.execute(() -> streamWorkflow(workflow.contextId(), emitter));
+        return emitter;
+    }
+
+    @GetMapping(value = "/a2a/tasks/{taskId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Map<String, Object> getTask(@PathVariable String taskId) {
+        return toA2aTask(orchestrator.getByTaskId(taskId));
+    }
+
+    @PostMapping(value = "/a2a/tasks/{taskId}:cancel", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Map<String, Object> cancelTask(@PathVariable String taskId) {
+        return toA2aTask(orchestrator.cancelByTaskId(taskId));
+    }
+
+    private WorkflowView createWorkflow(JsonNode request) {
         JsonNode message = request.path("message");
         String instruction = extractText(message.path("parts"));
         if (instruction.isBlank()) {
@@ -85,15 +121,40 @@ public class A2aServerController {
 
         String requestedContextId = message.path("contextId").asText("");
         String contextId = requestedContextId.isBlank() ? UUID.randomUUID().toString() : requestedContextId;
-        WorkflowView workflow = orchestrator.create(new CreateWorkflowCommand(
+        return orchestrator.create(new CreateWorkflowCommand(
                 contextId,
                 instruction,
                 List.of(new TaskNodeSpec("delegate", skill, instruction, List.of(), metadata))
         ));
+    }
 
-        boolean returnImmediately = request.path("configuration").path("returnImmediately").asBoolean(false);
-        WorkflowView response = returnImmediately ? workflow : awaitTerminal(contextId);
-        return toA2aTask(response);
+    private void streamWorkflow(String contextId, SseEmitter emitter) {
+        Instant deadline = Instant.now().plus(blockingTimeout);
+        Instant lastUpdate = Instant.EPOCH;
+        try {
+            while (Instant.now().isBefore(deadline)) {
+                WorkflowView workflow = orchestrator.get(contextId);
+                Instant update = workflow.tasks().stream()
+                        .map(TaskView::updatedAt).max(Instant::compareTo).orElse(Instant.EPOCH);
+                if (update.isAfter(lastUpdate)) {
+                    emitter.send(SseEmitter.event()
+                            .name("status-update")
+                            .data(toA2aTask(workflow), MediaType.APPLICATION_JSON));
+                    lastUpdate = update;
+                }
+                if (workflow.tasks().stream().allMatch(task -> task.state().terminal())) {
+                    emitter.complete();
+                    return;
+                }
+                Thread.sleep(25);
+            }
+            emitter.completeWithError(new IllegalStateException("A2A stream timed out"));
+        } catch (Exception failure) {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            emitter.completeWithError(failure);
+        }
     }
 
     private WorkflowView awaitTerminal(String contextId) {

@@ -6,19 +6,54 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class AgentTask {
-    private final String id = UUID.randomUUID().toString();
+    private final String id;
     private final String contextId;
     private final TaskNodeSpec spec;
-    private final Instant createdAt = Instant.now();
-    private final AtomicReference<TaskState> state = new AtomicReference<>(TaskState.SUBMITTED);
+    private final Instant createdAt;
+    private final AtomicReference<TaskState> state;
     private volatile String agentId;
     private volatile Artifact artifact;
     private volatile String error;
-    private volatile Instant updatedAt = createdAt;
+    private volatile Instant updatedAt;
 
     public AgentTask(String contextId, TaskNodeSpec spec) {
+        this(UUID.randomUUID().toString(), contextId, spec, TaskState.SUBMITTED, null, null, null, Instant.now(), Instant.now());
+    }
+
+    private AgentTask(
+            String id,
+            String contextId,
+            TaskNodeSpec spec,
+            TaskState state,
+            String agentId,
+            Artifact artifact,
+            String error,
+            Instant createdAt,
+            Instant updatedAt
+    ) {
+        this.id = id;
         this.contextId = contextId;
         this.spec = spec;
+        this.state = new AtomicReference<>(state);
+        this.agentId = agentId;
+        this.artifact = artifact;
+        this.error = error;
+        this.createdAt = createdAt;
+        this.updatedAt = updatedAt;
+    }
+
+    public static AgentTask restore(
+            String id,
+            String contextId,
+            TaskNodeSpec spec,
+            TaskState state,
+            String agentId,
+            Artifact artifact,
+            String error,
+            Instant createdAt,
+            Instant updatedAt
+    ) {
+        return new AgentTask(id, contextId, spec, state, agentId, artifact, error, createdAt, updatedAt);
     }
 
     public synchronized void assign(String selectedAgentId) {

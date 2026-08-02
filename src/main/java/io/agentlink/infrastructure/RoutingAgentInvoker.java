@@ -14,11 +14,16 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer;
 
 @Component
 public class RoutingAgentInvoker implements AgentInvoker {
     private final List<AgentRuntimeAdapter> adapters;
+    private final ConcurrentMap<String, AgentRuntimeAdapter> activeAdapters = new ConcurrentHashMap<>();
+    private final java.util.Set<String> canceledTasks = ConcurrentHashMap.newKeySet();
 
     public RoutingAgentInvoker(List<AgentRuntimeAdapter> adapters) {
         this.adapters = adapters.stream().sorted(Comparator.comparing(AgentRuntimeAdapter::runtime)).toList();
@@ -38,7 +43,25 @@ public class RoutingAgentInvoker implements AgentInvoker {
                 .orElseThrow(() -> new IllegalStateException("no runtime adapter for endpoint: " + agent.endpoint()));
         eventSink.accept(RuntimeEvent.of(adapter.runtime(), "selected", "selected adapter " + adapter.runtime()));
         int maxAttempts = parseMaxAttempts(task);
-        return invokeAttempt(adapter, agent, taskId, task, inputs, eventSink, 1, maxAttempts);
+        activeAdapters.put(taskId, adapter);
+        CompletionStage<Artifact> invocation =
+                invokeAttempt(adapter, agent, taskId, task, inputs, eventSink, 1, maxAttempts);
+        invocation.whenComplete((ignored, failure) -> {
+            activeAdapters.remove(taskId, adapter);
+            canceledTasks.remove(taskId);
+        });
+        return invocation;
+    }
+
+    @Override
+    public boolean cancel(String taskId) {
+        canceledTasks.add(taskId);
+        AgentRuntimeAdapter adapter = activeAdapters.get(taskId);
+        if (adapter == null) {
+            canceledTasks.remove(taskId);
+            return false;
+        }
+        return adapter.cancel(taskId);
     }
 
     private CompletionStage<Artifact> invokeAttempt(
@@ -54,6 +77,10 @@ public class RoutingAgentInvoker implements AgentInvoker {
         eventSink.accept(RuntimeEvent.of(adapter.runtime(), "attempt.started", attempt + "/" + maxAttempts));
         CompletableFuture<Artifact> result = new CompletableFuture<>();
         adapter.invoke(agent, taskId, task, inputs, eventSink).whenComplete((artifact, failure) -> {
+            if (canceledTasks.contains(taskId)) {
+                result.completeExceptionally(new CancellationException("task canceled"));
+                return;
+            }
             if (failure == null) {
                 result.complete(artifact);
                 return;

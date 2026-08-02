@@ -1,5 +1,7 @@
 package io.agentlink.application;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.agentlink.domain.AgentCard;
 import io.agentlink.domain.AgentTask;
 import io.agentlink.domain.Artifact;
@@ -19,6 +21,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @Service
 public class WorkflowOrchestrator {
@@ -28,6 +32,12 @@ public class WorkflowOrchestrator {
     private final TaskEventBus eventBus;
     private final WorkflowValidator validator;
     private final Executor executor;
+    private final ConcurrentMap<String, Workflow> activeWorkflows = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, CompletableFuture<Artifact>> activeTasks = new ConcurrentHashMap<>();
+    private final Counter workflowCreated;
+    private final Counter taskCompleted;
+    private final Counter taskFailed;
+    private final Counter taskCanceled;
 
     public WorkflowOrchestrator(
             AgentDirectory directory,
@@ -35,7 +45,8 @@ public class WorkflowOrchestrator {
             WorkflowStore store,
             TaskEventBus eventBus,
             WorkflowValidator validator,
-            @Qualifier("agentExecutionExecutor") Executor executor
+            @Qualifier("agentExecutionExecutor") Executor executor,
+            MeterRegistry meterRegistry
     ) {
         this.directory = directory;
         this.invoker = invoker;
@@ -43,6 +54,10 @@ public class WorkflowOrchestrator {
         this.eventBus = eventBus;
         this.validator = validator;
         this.executor = executor;
+        this.workflowCreated = meterRegistry.counter("agentlink.workflows.created");
+        this.taskCompleted = meterRegistry.counter("agentlink.task.completed");
+        this.taskFailed = meterRegistry.counter("agentlink.task.failed");
+        this.taskCanceled = meterRegistry.counter("agentlink.task.canceled");
     }
 
     public WorkflowView create(CreateWorkflowCommand command) {
@@ -59,6 +74,8 @@ public class WorkflowOrchestrator {
             throw new IllegalArgumentException("contextId already exists with a different workflow definition");
         }
         workflow.tasks().forEach(task -> publish(task, "task submitted"));
+        workflowCreated.increment();
+        activeWorkflows.put(contextId, workflow);
         schedule(workflow);
         return WorkflowView.from(workflow);
     }
@@ -66,6 +83,44 @@ public class WorkflowOrchestrator {
     public WorkflowView get(String contextId) {
         return store.find(contextId).map(WorkflowView::from)
                 .orElseThrow(() -> new WorkflowNotFoundException(contextId));
+    }
+
+    public WorkflowView getByTaskId(String taskId) {
+        return store.findByTaskId(taskId).map(WorkflowView::from)
+                .orElseThrow(() -> new WorkflowNotFoundException(taskId));
+    }
+
+    public WorkflowView cancelByTaskId(String taskId) {
+        Workflow workflow = activeWorkflows.values().stream()
+                .filter(candidate -> candidate.tasks().stream().anyMatch(task -> task.id().equals(taskId)))
+                .findFirst()
+                .orElseGet(() -> store.findByTaskId(taskId)
+                        .orElseThrow(() -> new WorkflowNotFoundException(taskId)));
+        return cancel(workflow.contextId());
+    }
+
+    public WorkflowView cancel(String contextId) {
+        Workflow workflow = activeWorkflows.get(contextId);
+        if (workflow == null) {
+            workflow = store.find(contextId).orElseThrow(() -> new WorkflowNotFoundException(contextId));
+        }
+        synchronized (workflow) {
+            for (AgentTask task : workflow.tasks()) {
+                if (!task.state().terminal()) {
+                    invoker.cancel(task.id());
+                    CompletableFuture<Artifact> future = activeTasks.remove(task.id());
+                    if (future != null) {
+                        future.cancel(true);
+                    }
+                    task.transition(TaskState.CANCELED, "canceled by coordinator");
+                    taskCanceled.increment();
+                    publish(task, "task canceled");
+                }
+            }
+            store.save(workflow);
+        }
+        activeWorkflows.remove(contextId, workflow);
+        return WorkflowView.from(workflow);
     }
 
     private void schedule(Workflow workflow) {
@@ -90,18 +145,27 @@ public class WorkflowOrchestrator {
 
         CompletableFuture<Artifact> future = CompletableFuture
                 .allOf(dependencies.toArray(CompletableFuture[]::new))
-                .thenComposeAsync(ignored -> execute(task, dependencies), executor);
+                .thenComposeAsync(ignored -> execute(workflow, task, dependencies), executor);
 
+        activeTasks.put(task.id(), future);
         future.whenComplete((artifact, failure) -> {
+            activeTasks.remove(task.id());
             if (failure != null && task.state() == TaskState.SUBMITTED) {
-                fail(task, "dependency failed: " + rootMessage(failure));
+                fail(workflow, task, "dependency failed: " + rootMessage(failure));
+            }
+            if (workflow.tasks().stream().allMatch(candidate -> candidate.state().terminal())) {
+                activeWorkflows.remove(workflow.contextId(), workflow);
             }
         });
         futures.put(task.spec().nodeId(), future);
         return future;
     }
 
-    private CompletableFuture<Artifact> execute(AgentTask task, List<CompletableFuture<Artifact>> dependencies) {
+    private CompletableFuture<Artifact> execute(
+            Workflow workflow,
+            AgentTask task,
+            List<CompletableFuture<Artifact>> dependencies
+    ) {
         String preferredAgentId = task.spec().metadata().get("agentId");
         AgentCard agent = (preferredAgentId == null
                 ? directory.select(task.spec().skill())
@@ -110,6 +174,7 @@ public class WorkflowOrchestrator {
 
         task.assign(agent.id());
         task.transition(TaskState.WORKING, null);
+        persist(workflow);
         publish(task, "delegated to " + agent.id());
 
         List<Artifact> inputs = new ArrayList<>();
@@ -125,18 +190,22 @@ public class WorkflowOrchestrator {
                 .toCompletableFuture()
                 .thenApply(artifact -> {
                     task.complete(artifact);
+                    taskCompleted.increment();
+                    persist(workflow);
                     publish(task, "artifact produced");
                     return artifact;
                 })
                 .exceptionally(failure -> {
-                    fail(task, rootMessage(failure));
+                    fail(workflow, task, rootMessage(failure));
                     throw new CompletionException(failure);
                 });
     }
 
-    private void fail(AgentTask task, String message) {
+    private void fail(Workflow workflow, AgentTask task, String message) {
         if (!task.state().terminal()) {
             task.transition(TaskState.FAILED, message);
+            taskFailed.increment();
+            persist(workflow);
             publish(task, message);
         }
     }
@@ -146,6 +215,12 @@ public class WorkflowOrchestrator {
                 0L, task.contextId(), task.id(), task.spec().nodeId(), task.state(), message,
                 task.artifact() == null ? null : task.artifact().id(), Instant.now()
         ));
+    }
+
+    private void persist(Workflow workflow) {
+        synchronized (workflow) {
+            store.save(workflow);
+        }
     }
 
     private String rootMessage(Throwable failure) {

@@ -47,10 +47,13 @@ Agents exchange Messages, task status, and Artifacts. They do not need access to
 - Context-level idempotency: replaying the same definition with the same `contextId` returns the existing workflow.
 - Task state constraints and immutable terminal states.
 - SSE TaskEvent stream with monotonic offsets and replay after reconnect.
+- Optional PostgreSQL snapshots, durable event replay, restart recovery, and an at-least-once transactional Outbox.
 - Runtime Adapter SPI with safe argument lists—no shell command interpolation.
 - Safe defaults: Codex read-only sandbox, Gemini/Claude/agy plan mode, workspace-root confinement, process timeout, and bounded Artifact size.
 - Bounded retries with exponential backoff (`maxAttempts`, 1–5).
 - Remote A2A HTTP invocation, Agent Card discovery, and an inbound AgentLink A2A endpoint.
+- A2A blocking/immediate send, SSE streaming, Task lookup/cancel, plus cancel propagation to local CLI processes.
+- Prometheus metrics and Spring Boot health probes.
 - SSRF protection for remote Agent endpoints; private networks are denied by default.
 
 ## Runtime support
@@ -63,7 +66,8 @@ Agents exchange Messages, task status, and Artifacts. They do not need access to
 | Google Antigravity `agy` | `--print` | final text | `plan` | Implemented, limited streaming |
 | Remote A2A agent | HTTP `message:send` | final Task/Message | AgentCard-defined | Inbound + outbound implemented |
 | Codex app-server | JSON-RPC/JSONL | rich item/turn events | configurable | Planned |
-| A2A streaming/push | SSE/Webhook | incremental artifacts | AgentCard-defined | Planned |
+| A2A streaming | HTTP SSE | incremental status | AgentCard-defined | Inbound implemented |
+| Durable webhook | Outbox + signed HTTP | event envelope | deployment policy | Implemented |
 
 The adapter table describes code support, not a claim that every vendor CLI is installed or authenticated in every deployment.
 
@@ -104,6 +108,26 @@ curl -N 'http://localhost:8096/api/v1/contexts/{contextId}/events?after=0'
 
 The SSE `id` is the event offset. Reconnect with the last received value in `after` to replay missed events.
 
+### Durable mode
+
+Memory mode is the zero-configuration default. For restart-safe workflows and events, start PostgreSQL and AgentLink together:
+
+```bash
+docker compose up --build
+```
+
+Or point a locally started process at PostgreSQL:
+
+```bash
+AGENTLINK_PERSISTENCE_MODE=jdbc \
+AGENTLINK_JDBC_URL=jdbc:postgresql://localhost:55432/agentlink \
+AGENTLINK_JDBC_USERNAME=agentlink \
+AGENTLINK_JDBC_PASSWORD=agentlink \
+mvn spring-boot:run
+```
+
+Flyway owns the schema. Workflow snapshots and ordered task events are persisted in the same database; interrupted non-terminal tasks are moved to `FAILED` on restart because replaying an arbitrary external agent process is not guaranteed to be safe.
+
 ## Selecting a runtime
 
 Each task declares a portable Skill. Set `metadata.agentId` only when a workflow intentionally requires a particular runtime:
@@ -143,7 +167,9 @@ AGENTLINK_ALLOW_PRIVATE=true mvn spring-boot:run
 
 Set the corresponding property as shown in [application.yml](src/main/resources/application.yml); do not enable it on an Internet-facing deployment without an outbound proxy or network policy.
 
-AgentLink itself is discoverable at `/.well-known/agent-card.json` and accepts blocking or immediate A2A requests at `/a2a/message:send`. An external A2A coordinator can select an internal Skill through request metadata without knowing which local or remote runtime will execute it.
+AgentLink itself is discoverable at `/.well-known/agent-card.json`. It supports blocking/immediate requests at `/a2a/message:send`, SSE status updates at `/a2a/message:stream`, and Task lookup/cancel at `/a2a/tasks/{taskId}` and `/a2a/tasks/{taskId}:cancel`. An external coordinator can select an internal Skill through request metadata without knowing which local or remote runtime will execute it.
+
+For durable outbound integration, set `agentlink.outbox.webhook.url` and optionally `agentlink.outbox.webhook.secret`. Delivered envelopes carry an `Idempotency-Key`; signed deliveries use `X-AgentLink-Signature: sha256=...`. Receivers must deduplicate because the relay intentionally uses at-least-once delivery. The same private-network SSRF policy used for remote agents applies to webhook targets.
 
 ## Configuration
 
@@ -154,6 +180,9 @@ AgentLink itself is discoverable at `/.well-known/agent-card.json` and accepts b
 | `agentlink.runtimes.max-artifact-chars` | `100000` | Maximum stored output size |
 | `agentlink.runtimes.bootstrap-cli` | `true` | Auto-register detected CLIs |
 | `agentlink.security.allow-private-agent-networks` | `false` | Allow private/loopback remote A2A endpoints |
+| `AGENTLINK_PERSISTENCE_MODE` | `memory` | Set to `jdbc` for PostgreSQL snapshots/events/Outbox |
+| `AGENTLINK_JDBC_URL` | `jdbc:postgresql://localhost:5432/agentlink` | Durable store JDBC URL |
+| `agentlink.outbox.webhook.url` | unset | Enable durable webhook delivery when configured |
 
 ## Architecture
 
@@ -168,7 +197,7 @@ See [docs/architecture.md](docs/architecture.md) for design decisions and trust 
 
 ## Current limitations
 
-The default WorkflowStore and TaskEventBus are in-memory. Restart recovery, PostgreSQL/Redis persistence, RocketMQ/Kafka delivery, cancellation propagation, A2A streaming, webhook notifications, authentication, and OpenTelemetry are not yet implemented. They remain explicit roadmap items rather than implied production features.
+Memory remains the default mode; production deployments should select JDBC explicitly. Restart recovery fails interrupted tasks safely instead of attempting non-idempotent automatic replay. Cluster-wide agent registration, broker-specific RocketMQ/Kafka publishers, outbound A2A streaming, push-notification registration, authentication/authorization, and distributed tracing remain roadmap items. PostgreSQL task lookup currently scans stored snapshots, so a normalized task index is recommended before very large deployments.
 
 ## Contributing
 

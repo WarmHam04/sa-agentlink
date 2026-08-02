@@ -21,6 +21,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -31,6 +33,7 @@ public abstract class AbstractCliRuntimeAdapter implements AgentRuntimeAdapter {
     private final ObjectMapper objectMapper;
     private final CliExecutionPolicy policy;
     private final Executor executor;
+    private final ConcurrentMap<String, Process> activeProcesses = new ConcurrentHashMap<>();
 
     protected AbstractCliRuntimeAdapter(
             ObjectMapper objectMapper,
@@ -58,6 +61,24 @@ public abstract class AbstractCliRuntimeAdapter implements AgentRuntimeAdapter {
         return CompletableFuture.supplyAsync(() -> executeProcess(agent, taskId, task, inputs, eventSink), executor);
     }
 
+    @Override
+    public boolean cancel(String taskId) {
+        Process process = activeProcesses.get(taskId);
+        if (process == null) {
+            return false;
+        }
+        process.destroy();
+        try {
+            if (!process.waitFor(2, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
+        return true;
+    }
+
     private Artifact executeProcess(
             AgentCard agent,
             String taskId,
@@ -79,6 +100,25 @@ public abstract class AbstractCliRuntimeAdapter implements AgentRuntimeAdapter {
         } catch (IOException failure) {
             throw new AgentProcessException(runtime(), "failed to start executable " + command.get(0), failure);
         }
+
+        activeProcesses.put(taskId, process);
+        try {
+            return awaitProcess(agent, taskId, task, eventSink, process);
+        } finally {
+            activeProcesses.remove(taskId, process);
+            if (process.isAlive()) {
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    private Artifact awaitProcess(
+            AgentCard agent,
+            String taskId,
+            TaskNodeSpec task,
+            Consumer<RuntimeEvent> eventSink,
+            Process process
+    ) {
 
         AtomicReference<String> finalText = new AtomicReference<>("");
         StringBuilder stdout = new StringBuilder();

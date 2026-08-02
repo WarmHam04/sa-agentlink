@@ -25,4 +25,8 @@ public interface AgentRuntimeAdapter {
             List<Artifact> inputs,
             Consumer<RuntimeEvent> eventSink
     );
+
+    default boolean cancel(String taskId) {
+        return false;
+    }
 }

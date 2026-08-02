@@ -44,7 +44,17 @@ CLI adapters translate provider event streams into RuntimeEvents:
 - Claude Code: stream-json assistant/result events.
 - Antigravity `agy`: final text until a structured streaming mode becomes public.
 
-Remote agents use the A2A HTTP `message:send` operation and Agent Card discovery. Standard A2A streaming, polling, push notification, and authentication coverage is planned.
+Remote agents use A2A HTTP `message:send` and Agent Card discovery. AgentLink's inbound surface also provides SSE status streaming plus Task lookup and cancellation; outbound remote invocation currently uses blocking send.
+
+## Durability and delivery
+
+`memory` mode keeps the development path small. `jdbc` mode uses PostgreSQL and Flyway for Workflow snapshots, ordered TaskEvents, and Outbox messages. Aggregate snapshots are written after every state transition; event offsets come from the database and can be replayed after an SSE reconnect.
+
+On startup, non-terminal snapshots are failed explicitly. This is a safety decision: an external CLI or remote Agent may have produced irreversible side effects before the coordinator stopped, so blind replay would violate at-most-once intent.
+
+The Outbox relay is at-least-once. A successful publisher batch sets `published_at`; a crash between delivery and marking can repeat an envelope, so publishers and receivers use the Outbox ID as an idempotency key. The included publisher supports optional HMAC-signed HTTP webhooks, while the `OutboxPublisher` port is the extension point for RocketMQ or Kafka.
+
+Cancellation moves all non-terminal Tasks in a Workflow to `CANCELED`, cancels their futures, and invokes the selected Runtime Adapter. CLI adapters terminate the tracked child process and force termination after a grace period.
 
 ## Security decisions
 
@@ -54,13 +64,12 @@ Remote agents use the A2A HTTP `message:send` operation and Agent Card discovery
 - Remote URLs reject credentials and private/local address ranges by default.
 - Output is truncated before storage to avoid unbounded memory growth.
 
-## Production adapter roadmap
+## Production roadmap
 
-The current in-memory ports are useful for local development and tests. Production profiles should provide:
+The durable baseline is implemented, but larger deployments still need:
 
-- PostgreSQL workflow/task/artifact persistence with optimistic versions;
-- an Outbox relay to RocketMQ or Kafka;
+- normalized Task indexes and optimistic snapshot versions;
+- broker-specific Outbox publishers for RocketMQ or Kafka;
 - Redis hot Task snapshots and distributed idempotency keys;
-- durable event offsets and replay;
 - OpenTelemetry spans keyed by Context, Task, Agent, and Artifact;
 - OAuth/OIDC and per-Agent authorization policies.
