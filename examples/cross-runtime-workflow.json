@@ -1,0 +1,38 @@
+{
+  "goal": "让不同厂商的 coding agent 协同完成代码审查与修复方案",
+  "nodes": [
+    {
+      "nodeId": "codex-review",
+      "skill": "code-review",
+      "instruction": "审查当前仓库的并发与可靠性风险，输出带文件位置的结论。只读，不修改文件。",
+      "dependsOn": [],
+      "metadata": {
+        "agentId": "codex-cli",
+        "sandbox": "read-only",
+        "workingDirectory": "."
+      }
+    },
+    {
+      "nodeId": "gemini-analysis",
+      "skill": "analysis",
+      "instruction": "从架构角度分析当前仓库的扩展性问题，给出优先级排序。只读，不修改文件。",
+      "dependsOn": [],
+      "metadata": {
+        "agentId": "gemini-cli",
+        "approvalMode": "plan",
+        "workingDirectory": "."
+      }
+    },
+    {
+      "nodeId": "claude-plan",
+      "skill": "coding",
+      "instruction": "结合两个上游 Agent 的 Artifact，形成一份去重后的最小修复计划。只读，不修改文件。",
+      "dependsOn": ["codex-review", "gemini-analysis"],
+      "metadata": {
+        "agentId": "claude-cli",
+        "permissionMode": "plan",
+        "workingDirectory": "."
+      }
+    }
+  ]
+}

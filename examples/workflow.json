@@ -1,0 +1,23 @@
+{
+  "goal": "调研一个主题并生成结构化报告",
+  "nodes": [
+    {
+      "nodeId": "search",
+      "skill": "knowledge-search",
+      "instruction": "检索与目标相关的可信证据",
+      "dependsOn": []
+    },
+    {
+      "nodeId": "analyze",
+      "skill": "analysis",
+      "instruction": "分析目标并给出报告结构",
+      "dependsOn": []
+    },
+    {
+      "nodeId": "write",
+      "skill": "report-generation",
+      "instruction": "结合检索证据和分析结果生成最终报告",
+      "dependsOn": ["search", "analyze"]
+    }
+  ]
+}

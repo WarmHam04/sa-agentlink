@@ -1,0 +1,22 @@
+server:
+  port: 8096
+
+spring:
+  application:
+    name: agentlink
+
+agentlink:
+  events:
+    history-limit: 1000
+  execution:
+    pool-size: 8
+  runtimes:
+    bootstrap-cli: true
+    workspace-root: ${AGENTLINK_WORKSPACE_ROOT:${user.dir}}
+    timeout: PT10M
+    max-artifact-chars: 100000
+  security:
+    allow-private-agent-networks: ${AGENTLINK_ALLOW_PRIVATE:false}
+  a2a:
+    public-base-url: ${AGENTLINK_PUBLIC_BASE_URL:http://localhost:8096}
+    blocking-timeout: PT2M
