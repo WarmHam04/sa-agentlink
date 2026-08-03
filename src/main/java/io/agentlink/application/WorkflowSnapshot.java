@@ -22,12 +22,13 @@ public record WorkflowSnapshot(
         );
     }
 
-    public Workflow restore() {
+    public Workflow restore(long version) {
         return Workflow.restore(
                 contextId,
                 goal,
                 createdAt,
-                tasks.stream().map(task -> task.restore(contextId)).toList()
+                tasks.stream().map(task -> task.restore(contextId)).toList(),
+                version
         );
     }
 

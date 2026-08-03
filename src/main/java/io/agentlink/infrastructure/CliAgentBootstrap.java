@@ -18,13 +18,17 @@ import java.util.List;
 public class CliAgentBootstrap implements ApplicationRunner {
     private final AgentDirectory directory;
     private final boolean enabled;
+    private final String localIdSuffix;
 
     public CliAgentBootstrap(
             AgentDirectory directory,
-            @Value("${agentlink.runtimes.bootstrap-cli:true}") boolean enabled
+            @Value("${agentlink.runtimes.bootstrap-cli:true}") boolean enabled,
+            @Value("${agentlink.persistence.mode:memory}") String persistenceMode,
+            @Value("${agentlink.cluster.instance-id:${random.uuid}}") String instanceId
     ) {
         this.directory = directory;
         this.enabled = enabled;
+        this.localIdSuffix = "jdbc".equalsIgnoreCase(persistenceMode) ? "@" + shortId(instanceId) : "";
     }
 
     @Override
@@ -49,7 +53,7 @@ public class CliAgentBootstrap implements ApplicationRunner {
     private void registerIfAvailable(String executable, String name, int load, AgentSkill... skills) {
         if (findOnPath(executable)) {
             directory.register(new AgentCard(
-                    executable + "-cli", name, "process://" + executable, "cli-jsonl-v1",
+                    executable + "-cli" + localIdSuffix, name, "process://" + executable, "cli-jsonl-v1",
                     List.of(skills), true, load
             ));
         }
@@ -67,5 +71,10 @@ public class CliAgentBootstrap implements ApplicationRunner {
 
     private AgentSkill skill(String name, String description) {
         return new AgentSkill(name, description);
+    }
+
+    private String shortId(String instanceId) {
+        String normalized = instanceId.replaceAll("[^A-Za-z0-9_-]", "");
+        return normalized.isEmpty() ? "node" : normalized.substring(0, Math.min(8, normalized.length()));
     }
 }

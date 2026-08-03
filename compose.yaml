@@ -25,9 +25,31 @@ services:
       AGENTLINK_JDBC_URL: jdbc:postgresql://postgres:5432/agentlink
       AGENTLINK_JDBC_USERNAME: agentlink
       AGENTLINK_JDBC_PASSWORD: agentlink
+      AGENTLINK_INSTANCE_ID: compose-1
       AGENTLINK_WORKSPACE_ROOT: /workspace
+      OTEL_TRACES_EXPORTER: none
     ports:
       - "8096:8096"
+    volumes:
+      - ./:/workspace:ro
+
+  agentlink-2:
+    profiles: ["cluster"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AGENTLINK_PERSISTENCE_MODE: jdbc
+      AGENTLINK_JDBC_URL: jdbc:postgresql://postgres:5432/agentlink
+      AGENTLINK_JDBC_USERNAME: agentlink
+      AGENTLINK_JDBC_PASSWORD: agentlink
+      AGENTLINK_INSTANCE_ID: compose-2
+      AGENTLINK_WORKSPACE_ROOT: /workspace
+      AGENTLINK_PUBLIC_BASE_URL: http://localhost:8097
+      OTEL_TRACES_EXPORTER: none
+    ports:
+      - "8097:8096"
     volumes:
       - ./:/workspace:ro
 

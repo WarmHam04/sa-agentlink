@@ -2,6 +2,8 @@ package io.agentlink.application;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.agentlink.infrastructure.AgentLinkTelemetry;
+import io.opentelemetry.context.Scope;
 import io.agentlink.domain.AgentCard;
 import io.agentlink.domain.AgentTask;
 import io.agentlink.domain.Artifact;
@@ -11,8 +13,11 @@ import io.agentlink.domain.TaskState;
 import io.agentlink.domain.Workflow;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -34,6 +39,11 @@ public class WorkflowOrchestrator {
     private final Executor executor;
     private final ConcurrentMap<String, Workflow> activeWorkflows = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, CompletableFuture<Artifact>> activeTasks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, WorkflowLease> activeLeases = new ConcurrentHashMap<>();
+    private final WorkflowLeaseManager leaseManager;
+    private final String instanceId;
+    private final Duration leaseTtl;
+    private final AgentLinkTelemetry telemetry;
     private final Counter workflowCreated;
     private final Counter taskCompleted;
     private final Counter taskFailed;
@@ -46,7 +56,11 @@ public class WorkflowOrchestrator {
             TaskEventBus eventBus,
             WorkflowValidator validator,
             @Qualifier("agentExecutionExecutor") Executor executor,
-            MeterRegistry meterRegistry
+            MeterRegistry meterRegistry,
+            WorkflowLeaseManager leaseManager,
+            AgentLinkTelemetry telemetry,
+            @Value("${agentlink.cluster.instance-id:${random.uuid}}") String instanceId,
+            @Value("${agentlink.cluster.workflow-lease-ttl:PT30S}") Duration leaseTtl
     ) {
         this.directory = directory;
         this.invoker = invoker;
@@ -54,6 +68,10 @@ public class WorkflowOrchestrator {
         this.eventBus = eventBus;
         this.validator = validator;
         this.executor = executor;
+        this.leaseManager = leaseManager;
+        this.instanceId = instanceId;
+        this.leaseTtl = leaseTtl;
+        this.telemetry = telemetry;
         this.workflowCreated = meterRegistry.counter("agentlink.workflows.created");
         this.taskCompleted = meterRegistry.counter("agentlink.task.completed");
         this.taskFailed = meterRegistry.counter("agentlink.task.failed");
@@ -73,6 +91,10 @@ public class WorkflowOrchestrator {
             }
             throw new IllegalArgumentException("contextId already exists with a different workflow definition");
         }
+        WorkflowLease lease = leaseManager.acquire(contextId, instanceId, leaseTtl)
+                .orElseThrow(() -> new WorkflowLeaseUnavailableException(contextId));
+        activeLeases.put(contextId, lease);
+        telemetry.startWorkflow(contextId, workflow.goal(), workflow.tasks().size());
         workflow.tasks().forEach(task -> publish(task, "task submitted"));
         workflowCreated.increment();
         activeWorkflows.put(contextId, workflow);
@@ -104,6 +126,12 @@ public class WorkflowOrchestrator {
         if (workflow == null) {
             workflow = store.find(contextId).orElseThrow(() -> new WorkflowNotFoundException(contextId));
         }
+        WorkflowLease lease = activeLeases.get(contextId);
+        if (lease == null) {
+            lease = leaseManager.acquire(contextId, instanceId, leaseTtl)
+                    .orElseThrow(() -> new WorkflowLeaseUnavailableException(contextId));
+            activeLeases.put(contextId, lease);
+        }
         synchronized (workflow) {
             for (AgentTask task : workflow.tasks()) {
                 if (!task.state().terminal()) {
@@ -113,13 +141,14 @@ public class WorkflowOrchestrator {
                         future.cancel(true);
                     }
                     task.transition(TaskState.CANCELED, "canceled by coordinator");
+                    telemetry.endTask(task.id(), TaskState.CANCELED, null);
                     taskCanceled.increment();
                     publish(task, "task canceled");
                 }
             }
-            store.save(workflow);
+            store.save(workflow, lease);
         }
-        activeWorkflows.remove(contextId, workflow);
+        releaseWorkflow(workflow);
         return WorkflowView.from(workflow);
     }
 
@@ -150,11 +179,12 @@ public class WorkflowOrchestrator {
         activeTasks.put(task.id(), future);
         future.whenComplete((artifact, failure) -> {
             activeTasks.remove(task.id());
-            if (failure != null && task.state() == TaskState.SUBMITTED) {
-                fail(workflow, task, "dependency failed: " + rootMessage(failure));
+            if (failure != null && !task.state().terminal()) {
+                String prefix = task.state() == TaskState.SUBMITTED ? "dependency failed: " : "";
+                fail(workflow, task, prefix + rootMessage(failure));
             }
             if (workflow.tasks().stream().allMatch(candidate -> candidate.state().terminal())) {
-                activeWorkflows.remove(workflow.contextId(), workflow);
+                releaseWorkflow(workflow);
             }
         });
         futures.put(task.spec().nodeId(), future);
@@ -180,16 +210,27 @@ public class WorkflowOrchestrator {
         List<Artifact> inputs = new ArrayList<>();
         dependencies.forEach(future -> inputs.add(future.join()));
 
-        return invoker.invoke(
-                        agent,
-                        task.id(),
-                        task.spec(),
-                        List.copyOf(inputs),
-                        event -> publish(task, "runtime/" + event.runtime() + "/" + event.type() + ": " + event.message())
-                )
-                .toCompletableFuture()
+        CompletableFuture<Artifact> invocation;
+        try (Scope ignored = telemetry.startTask(
+                task.contextId(), task.id(), task.spec().nodeId(), task.spec().skill(), agent
+        )) {
+            invocation = invoker.invoke(
+                            agent,
+                            task.id(),
+                            task.spec(),
+                            List.copyOf(inputs),
+                            event -> {
+                                telemetry.runtimeEvent(task.id(), event);
+                                publish(task, "runtime/" + event.runtime() + "/" + event.type()
+                                        + ": " + event.message());
+                            }
+                    )
+                    .toCompletableFuture();
+        }
+        return invocation
                 .thenApply(artifact -> {
                     task.complete(artifact);
+                    telemetry.endTask(task.id(), TaskState.COMPLETED, null);
                     taskCompleted.increment();
                     persist(workflow);
                     publish(task, "artifact produced");
@@ -204,6 +245,7 @@ public class WorkflowOrchestrator {
     private void fail(Workflow workflow, AgentTask task, String message) {
         if (!task.state().terminal()) {
             task.transition(TaskState.FAILED, message);
+            telemetry.endTask(task.id(), TaskState.FAILED, new IllegalStateException(message));
             taskFailed.increment();
             persist(workflow);
             publish(task, message);
@@ -219,8 +261,63 @@ public class WorkflowOrchestrator {
 
     private void persist(Workflow workflow) {
         synchronized (workflow) {
-            store.save(workflow);
+            WorkflowLease lease = activeLeases.get(workflow.contextId());
+            if (lease == null) {
+                store.save(workflow);
+            } else {
+                store.save(workflow, lease);
+            }
         }
+    }
+
+    @Scheduled(fixedDelayString = "${agentlink.cluster.workflow-lease-renew-interval:10000}")
+    public void renewLeases() {
+        activeLeases.forEach((contextId, lease) -> leaseManager.renew(lease, leaseTtl)
+                .ifPresentOrElse(
+                        renewed -> activeLeases.replace(contextId, lease, renewed),
+                        () -> abandonWorkflow(contextId, lease)
+                ));
+    }
+
+    private void abandonWorkflow(String contextId, WorkflowLease lease) {
+        if (!activeLeases.remove(contextId, lease)) {
+            return;
+        }
+        telemetry.leaseLost(contextId, lease.fencingToken());
+        Workflow workflow = activeWorkflows.remove(contextId);
+        if (workflow != null) {
+            workflow.tasks().forEach(task -> {
+                invoker.cancel(task.id());
+                CompletableFuture<Artifact> future = activeTasks.remove(task.id());
+                if (future != null) {
+                    future.cancel(true);
+                }
+                telemetry.endTask(task.id(), TaskState.FAILED,
+                        new WorkflowLeaseLostException(contextId, lease.fencingToken()));
+            });
+        }
+    }
+
+    private void releaseWorkflow(Workflow workflow) {
+        activeWorkflows.remove(workflow.contextId(), workflow);
+        WorkflowLease lease = activeLeases.remove(workflow.contextId());
+        if (lease != null) {
+            leaseManager.release(lease);
+        }
+        telemetry.endWorkflow(workflow.contextId(), workflowOutcome(workflow));
+    }
+
+    private TaskState workflowOutcome(Workflow workflow) {
+        if (workflow.tasks().stream().anyMatch(task -> task.state() == TaskState.FAILED)) {
+            return TaskState.FAILED;
+        }
+        if (workflow.tasks().stream().anyMatch(task -> task.state() == TaskState.REJECTED)) {
+            return TaskState.REJECTED;
+        }
+        if (workflow.tasks().stream().anyMatch(task -> task.state() == TaskState.CANCELED)) {
+            return TaskState.CANCELED;
+        }
+        return TaskState.COMPLETED;
     }
 
     private String rootMessage(Throwable failure) {

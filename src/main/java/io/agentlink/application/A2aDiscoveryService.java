@@ -75,7 +75,8 @@ public class A2aDiscoveryService {
             throw new IllegalArgumentException("Agent Card declares no skills");
         }
         String id = requestedId == null || requestedId.isBlank() ? slug(name) : requestedId;
-        return new AgentCard(id, name, endpoint, version, skills, true, 50);
+        boolean streaming = document.path("capabilities").path("streaming").asBoolean(false);
+        return new AgentCard(id, name, endpoint, version, skills, true, 50, streaming);
     }
 
     private String requiredText(JsonNode document, String field) {

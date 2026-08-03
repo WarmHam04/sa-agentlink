@@ -11,7 +11,12 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.server.ResponseStatusException;
 
+import java.time.Duration;
 import java.util.List;
 
 @RestController
@@ -19,10 +24,16 @@ import java.util.List;
 public class AgentController {
     private final AgentDirectory directory;
     private final A2aDiscoveryService discoveryService;
+    private final Duration registrationTtl;
 
-    public AgentController(AgentDirectory directory, A2aDiscoveryService discoveryService) {
+    public AgentController(
+            AgentDirectory directory,
+            A2aDiscoveryService discoveryService,
+            @Value("${agentlink.cluster.agent-registration-ttl:PT45S}") Duration registrationTtl
+    ) {
         this.directory = directory;
         this.discoveryService = discoveryService;
+        this.registrationTtl = registrationTtl;
     }
 
     @PostMapping
@@ -42,5 +53,23 @@ public class AgentController {
     @ResponseStatus(HttpStatus.CREATED)
     public AgentCard discover(@Valid @RequestBody DiscoverAgentRequest request) {
         return discoveryService.discover(request.cardUrl(), request.id());
+    }
+
+    @PostMapping("/{agentId}/heartbeat")
+    public void heartbeat(
+            @PathVariable String agentId,
+            @Valid @RequestBody AgentHeartbeatRequest request
+    ) {
+        if (!directory.heartbeat(agentId, request.healthy(), request.load(), registrationTtl)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "agent registration not found or not owned");
+        }
+    }
+
+    @DeleteMapping("/{agentId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void unregister(@PathVariable String agentId) {
+        if (!directory.unregister(agentId)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "agent registration not found or not owned");
+        }
     }
 }

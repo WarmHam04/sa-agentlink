@@ -10,8 +10,21 @@ public record AgentCard(
         String protocolVersion,
         List<AgentSkill> skills,
         boolean healthy,
-        int load
+        int load,
+        boolean streaming
 ) {
+    public AgentCard(
+            String id,
+            String name,
+            String endpoint,
+            String protocolVersion,
+            List<AgentSkill> skills,
+            boolean healthy,
+            int load
+    ) {
+        this(id, name, endpoint, protocolVersion, skills, healthy, load, false);
+    }
+
     public AgentCard {
         Objects.requireNonNull(id, "agent id must not be null");
         Objects.requireNonNull(name, "agent name must not be null");

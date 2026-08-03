@@ -1,6 +1,16 @@
 server:
   port: 8096
 
+otel:
+  service:
+    name: sa-agentlink
+  traces:
+    exporter: ${OTEL_TRACES_EXPORTER:none}
+  metrics:
+    exporter: ${OTEL_METRICS_EXPORTER:none}
+  logs:
+    exporter: ${OTEL_LOGS_EXPORTER:none}
+
 spring:
   application:
     name: agentlink
@@ -27,14 +37,24 @@ agentlink:
     history-limit: 1000
   outbox:
     poll-interval: 1000
+    claim-ttl: PT30S
+  cluster:
+    instance-id: ${AGENTLINK_INSTANCE_ID:${random.uuid}}
+    workflow-lease-ttl: PT30S
+    workflow-lease-renew-interval: 10000
+    agent-registration-ttl: PT45S
+    agent-registry-prune-interval: 30000
+    agent-registry-renew-interval: 15000
   execution:
     pool-size: 8
   runtimes:
     bootstrap-cli: true
+    demo-agents: true
     workspace-root: ${AGENTLINK_WORKSPACE_ROOT:${user.dir}}
     timeout: PT10M
     max-artifact-chars: 100000
   security:
+    mode: ${AGENTLINK_SECURITY_MODE:permit-all}
     allow-private-agent-networks: ${AGENTLINK_ALLOW_PRIVATE:false}
   a2a:
     public-base-url: ${AGENTLINK_PUBLIC_BASE_URL:http://localhost:8096}

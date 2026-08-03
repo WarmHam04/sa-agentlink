@@ -21,8 +21,10 @@ public class InMemoryWorkflowStore implements WorkflowStore {
     }
 
     @Override
-    public void save(Workflow workflow) {
+    public synchronized void save(Workflow workflow) {
         workflows.put(workflow.contextId(), workflow);
+        long version = workflow.version();
+        workflow.markPersisted(version, version + 1);
     }
 
     @Override

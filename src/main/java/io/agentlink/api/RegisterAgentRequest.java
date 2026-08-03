@@ -16,9 +16,10 @@ public record RegisterAgentRequest(
         String protocolVersion,
         @NotEmpty List<AgentSkill> skills,
         boolean healthy,
-        @Min(0) @Max(100) int load
+        @Min(0) @Max(100) int load,
+        boolean streaming
 ) {
     public AgentCard toCard() {
-        return new AgentCard(id, name, endpoint, protocolVersion, skills, healthy, load);
+        return new AgentCard(id, name, endpoint, protocolVersion, skills, healthy, load, streaming);
     }
 }
