@@ -35,6 +35,10 @@ public class A2aDiscoveryService {
     }
 
     public AgentCard discover(String cardUrl, String requestedId) {
+        return discover("_system", cardUrl, requestedId);
+    }
+
+    public AgentCard discover(String tenantId, String cardUrl, String requestedId) {
         try {
             HttpRequest request = HttpRequest.newBuilder(outboundUrlPolicy.validate(cardUrl))
                     .timeout(Duration.ofSeconds(20))
@@ -46,7 +50,7 @@ public class A2aDiscoveryService {
                 throw new IllegalArgumentException("Agent Card endpoint returned HTTP " + response.statusCode());
             }
             AgentCard card = mapCard(objectMapper.readTree(response.body()), requestedId);
-            directory.register(card);
+            directory.register(tenantId, card);
             return card;
         } catch (InterruptedException failure) {
             Thread.currentThread().interrupt();

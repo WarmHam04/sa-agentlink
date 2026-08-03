@@ -59,6 +59,10 @@ Agents exchange Messages, task status, and Artifacts. They do not need access to
 - OpenTelemetry Workflow/Task spans with runtime events, Agent attributes, failure status, lease-loss events, and OTLP-compatible exporters.
 - Optional OAuth2 Resource Server mode with JWT/OIDC validation and operation-specific scopes.
 - At-least-once Webhook, Kafka, and RocketMQ Outbox publishers with multi-node claim ownership and retry diagnostics.
+- JWT tenant-claim ABAC across Workflow, Task, event replay, Outbox, and tenant/private Agent registration; system Agents remain explicitly shared.
+- PostgreSQL fixed-window request limits, daily Workflow quotas, and serialized active-Workflow reservations with expiry/renewal.
+- Exponential Outbox retry, tenant-scoped dead-letter queues, administrator replay, and `Retry-After` responses for admission rejection.
+- Per-tenant home-region routing with optimistic routing epochs and a fenced, administrator-controlled failover operation.
 - SSRF protection for remote Agent endpoints; private networks are denied by default.
 
 ## Runtime support
@@ -215,7 +219,21 @@ SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI=https://id.example.com/real
 java -jar agentlink.jar
 ```
 
-Tokens use these scopes: `agentlink.execute`, `agentlink.read`, `agentlink.cancel`, `agentlink.agents.read`, `agentlink.agents.write`, and `agentlink.metrics`. Health, info, and the public Agent Card remain unauthenticated.
+Tokens use these scopes: `agentlink.execute`, `agentlink.read`, `agentlink.cancel`, `agentlink.agents.read`, `agentlink.agents.write`, `agentlink.metrics`, and `agentlink.admin`. Health, info, and the public Agent Card remain unauthenticated.
+
+Every OAuth2 request below the AgentLink API must also carry a valid tenant claim (default claim name: `tenant_id`). Resource queries include that tenant boundary and return `404` for another tenant's IDs. A token with `agentlink.admin` may deliberately act for another tenant by adding `X-AgentLink-Tenant`; ordinary tokens cannot override their claim.
+
+Administrator APIs include:
+
+```text
+GET  /api/v1/admin/tenant-policy
+PUT  /api/v1/admin/tenant-policy
+POST /api/v1/admin/tenant-policy:failover
+GET  /api/v1/admin/outbox/dead-letters
+POST /api/v1/admin/outbox/dead-letters/{outboxId}:replay
+```
+
+All are tenant-scoped. In OAuth2 mode they require `agentlink.admin`.
 
 ### OpenTelemetry
 
@@ -240,6 +258,7 @@ java -jar agentlink.jar
 | `AGENTLINK_PERSISTENCE_MODE` | `memory` | Set to `jdbc` for PostgreSQL snapshots/events/Outbox |
 | `AGENTLINK_JDBC_URL` | `jdbc:postgresql://localhost:5432/agentlink` | Durable store JDBC URL |
 | `AGENTLINK_INSTANCE_ID` | random UUID | Stable, unique cluster member ID |
+| `AGENTLINK_REGION` | `local` | Region identity used by tenant write routing |
 | `agentlink.cluster.workflow-lease-ttl` | `PT30S` | Workflow ownership lease duration |
 | `agentlink.cluster.agent-registration-ttl` | `PT45S` | Agent Registry registration lifetime |
 | `agentlink.outbox.webhook.url` | unset | Enable durable webhook delivery when configured |
@@ -248,8 +267,34 @@ java -jar agentlink.jar
 | `AGENTLINK_OUTBOX_ROCKETMQ_ENDPOINTS` | unset | RocketMQ 5.x proxy endpoint |
 | `AGENTLINK_OUTBOX_ROCKETMQ_TOPIC` | unset | Enable RocketMQ Outbox publisher |
 | `AGENTLINK_SECURITY_MODE` | `permit-all` | Set to `oauth2` for JWT/OIDC enforcement |
+| `AGENTLINK_TENANT_CLAIM` | `tenant_id` | JWT claim containing the tenant ID |
+| `AGENTLINK_DEFAULT_TENANT` | `_default` | Development tenant in `permit-all` mode |
+| `agentlink.tenancy.rate-bucket-retention` | `P2D` | Retention for distributed fixed-window counters |
+| `agentlink.tenancy.maintenance-interval` | `3600000` | Expired reservation/counter cleanup interval in milliseconds |
 | `SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI` | unset | Trusted OIDC issuer |
 | `OTEL_TRACES_EXPORTER` | `none` | OpenTelemetry trace exporter, for example `otlp` |
+
+Tenant limits are stored in `agentlink_tenant_policy`. Defaults are 600 requests/minute, 10,000 Workflows/day, and 100 concurrently reserved Workflows. Configure them through the administrator API; rejected requests return `429` and `Retry-After`.
+
+### Load and fault testing
+
+The repository includes a constant-arrival-rate k6 scenario with executable latency/error thresholds:
+
+```bash
+k6 run -e RATE=5 -e DURATION=30s tests/load/workflow-smoke.js
+```
+
+For deterministic PostgreSQL network faults, start the Toxiproxy profile and initialize the proxy:
+
+```bash
+docker compose -f compose.yaml -f compose.chaos.yaml --profile chaos up -d postgres toxiproxy
+tests/chaos/postgres-toxic.sh init
+tests/chaos/postgres-toxic.sh latency   # add latency
+tests/chaos/postgres-toxic.sh cut       # simulate partition
+tests/chaos/postgres-toxic.sh reset
+```
+
+Run the application against `jdbc:postgresql://localhost:15432/agentlink`. See [docs/multi-region.md](docs/multi-region.md) for the failover contract.
 
 ## Architecture
 
@@ -260,11 +305,11 @@ io.agentlink.infrastructure runtime adapters, registry, workflow store, event bu
 io.agentlink.api             REST/SSE endpoints and validation
 ```
 
-See [docs/architecture.md](docs/architecture.md) for consistency rules and trust boundaries, and [docs/production.md](docs/production.md) for deployment guidance.
+See [docs/architecture.md](docs/architecture.md) for consistency rules, [docs/production.md](docs/production.md) for deployment guidance, and [docs/multi-region.md](docs/multi-region.md) for regional ownership and failover.
 
 ## Current limitations
 
-This is a production-oriented early framework, not a complete control plane. PostgreSQL is currently the coordination dependency; there is no multi-region consensus or Redis lease backend. Registry membership is lease-based rather than backed by Kubernetes/Consul discovery. OAuth authorization is scope-based, without tenant/resource ABAC. Kafka and RocketMQ delivery is at-least-once, so consumers must deduplicate by Outbox ID. Automatic retries cannot prove that an arbitrary external Agent action is idempotent. A2A push-notification registration, durable streaming cursors across services, administrative UI, quotas, admission control, and soak/chaos benchmarks remain future work.
+This is a production-oriented control-plane baseline, not a turnkey global platform. PostgreSQL remains the coordination authority and the implemented regional model is single-writer per tenant, not multi-primary consensus. Registry membership is lease-based rather than backed by Kubernetes/Consul discovery. Kafka and RocketMQ delivery remains at-least-once, so consumers must deduplicate by Outbox ID. Automatic retries cannot prove that an arbitrary external Agent action is idempotent. A2A push-notification registration, durable cross-service streaming cursors, a management UI, and published long-duration soak/chaos results remain future work.
 
 ## Contributing
 

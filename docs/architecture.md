@@ -48,6 +48,16 @@ A write compares the expected snapshot version. Execution additionally requires 
 
 Terminal completion releases the lease. Startup recovery must acquire a lease before converting interrupted Tasks to `FAILED`. The system deliberately does not blindly replay external Agent calls because their side effects may not be idempotent.
 
+Every durable resource carries a tenant ID. Workflow/Task lookup and event replay require the caller tenant, and Outbox/DLQ administration filters by the same boundary. Agent registrations are tenant-private unless registered as `_system`, which is reserved for coordinator-owned shared runtimes.
+
+## Tenant admission and regional fencing
+
+The JWT tenant claim is converted into an immutable request identity after signature, issuer, time, and scope validation. An administrator can explicitly override it with `X-AgentLink-Tenant`; ordinary callers cannot. Resource mismatches resolve as not found to avoid identifier enumeration.
+
+PostgreSQL stores tenant limits and home-region ownership. Request admission uses atomic fixed-window counters. Workflow admission locks the tenant policy row, consumes the daily quota, checks active reservations, and inserts a renewable Context reservation. The policy-row lock serializes concurrent admissions for the same tenant.
+
+A controlled region failover is a compare-and-set operation on `routing_epoch`. In one transaction it changes `home_region`, increments the epoch, advances persisted Workflow epochs, and revokes old Workflow leases. An old process retains the former epoch in memory, so its next lease renewal or snapshot compare-and-set fails.
+
 ## Cluster Agent Registry
 
 In JDBC mode AgentCards and Skills are normalized in PostgreSQL. Registration records contain owner instance, revision, and lease expiry. Each node renews its owned records and periodically removes expired membership.
@@ -77,9 +87,11 @@ Task events and Outbox rows commit in the same database transaction. Relay nodes
 
 Webhook, Kafka, and RocketMQ publishers share one JSON envelope. Kafka keys records by aggregate ID and includes Outbox/event headers. RocketMQ uses the official 5.x gRPC producer. The row is marked published only after every configured publisher acknowledges it. Delivery is intentionally at-least-once, so receivers deduplicate by Outbox ID.
 
+Failures use bounded exponential backoff. After the configured maximum attempt, the row becomes a tenant-scoped dead letter and is excluded from relay claims. An administrator can inspect and explicitly replay it; replay clears failure state and resets the attempt counter without changing the stable Outbox ID.
+
 ## Security boundary
 
-Local development defaults to `permit-all`. OAuth2 mode configures a stateless JWT Resource Server and separates execute, read, cancel, Agent Registry, and metrics scopes. Identity verification comes from the configured OIDC issuer; AgentLink does not issue tokens.
+Local development defaults to `permit-all`. OAuth2 mode configures a stateless JWT Resource Server and separates execute, read, cancel, Agent Registry, metrics, and administrator scopes. Identity verification comes from the configured OIDC issuer; AgentLink does not issue tokens. Tenant ABAC is applied in addition to scopes.
 
 Independent defenses remain necessary:
 
@@ -98,4 +110,4 @@ Prometheus metrics and health probes complement traces. Production alerting shou
 
 ## Deliberate limitations
 
-The design is a horizontally scalable production-pilot baseline, not a finished enterprise control plane. PostgreSQL is the single coordination authority. Authorization is scope-based rather than tenant-aware ABAC. There is no durable A2A push-notification subscription, multi-region consensus, management UI, quota/admission layer, or published chaos/soak SLO evidence yet.
+The design is a horizontally scalable production control-plane baseline, not a finished enterprise platform. PostgreSQL is still the coordination authority. Regional ownership is fenced single-writer routing, not multi-primary consensus. There is no durable A2A push-notification subscription, management UI, or published long-duration soak/chaos SLO evidence yet.

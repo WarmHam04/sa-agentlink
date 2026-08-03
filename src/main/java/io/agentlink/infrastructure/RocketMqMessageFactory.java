@@ -27,6 +27,7 @@ public class RocketMqMessageFactory {
                 .setKeys(Long.toString(message.id()))
                 .setTag(message.eventType().replace('.', '_'))
                 .addProperty("agentlink-aggregate-id", message.aggregateId())
+                .addProperty("agentlink-tenant-id", message.tenantId())
                 .setBody(envelopes.serialize(message).getBytes(StandardCharsets.UTF_8))
                 .build();
     }

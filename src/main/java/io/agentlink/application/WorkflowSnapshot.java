@@ -10,6 +10,8 @@ import java.time.Instant;
 import java.util.List;
 
 public record WorkflowSnapshot(
+        String tenantId,
+        long routingEpoch,
         String contextId,
         String goal,
         Instant createdAt,
@@ -17,13 +19,19 @@ public record WorkflowSnapshot(
 ) {
     public static WorkflowSnapshot from(Workflow workflow) {
         return new WorkflowSnapshot(
-                workflow.contextId(), workflow.goal(), workflow.createdAt(),
+                workflow.tenantId(), workflow.routingEpoch(), workflow.contextId(), workflow.goal(), workflow.createdAt(),
                 workflow.tasks().stream().map(TaskSnapshot::from).toList()
         );
     }
 
     public Workflow restore(long version) {
+        return restore(version, tenantId == null ? "_default" : tenantId, routingEpoch == 0 ? 1L : routingEpoch);
+    }
+
+    public Workflow restore(long version, String storedTenantId, long storedRoutingEpoch) {
         return Workflow.restore(
+                storedTenantId,
+                storedRoutingEpoch,
                 contextId,
                 goal,
                 createdAt,

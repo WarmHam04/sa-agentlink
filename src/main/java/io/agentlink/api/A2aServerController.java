@@ -19,6 +19,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import jakarta.servlet.http.HttpServletRequest;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -34,17 +35,20 @@ public class A2aServerController {
     private final String publicBaseUrl;
     private final Duration blockingTimeout;
     private final Executor streamExecutor;
+    private final TenantIdentityResolver tenants;
 
     public A2aServerController(
             WorkflowOrchestrator orchestrator,
             @Value("${agentlink.a2a.public-base-url:http://localhost:8096}") String publicBaseUrl,
             @Value("${agentlink.a2a.blocking-timeout:PT2M}") Duration blockingTimeout,
-            @Qualifier("agentProcessExecutor") Executor streamExecutor
+            @Qualifier("agentProcessExecutor") Executor streamExecutor,
+            TenantIdentityResolver tenants
     ) {
         this.orchestrator = orchestrator;
         this.publicBaseUrl = publicBaseUrl.replaceAll("/+$", "");
         this.blockingTimeout = blockingTimeout;
         this.streamExecutor = streamExecutor;
+        this.tenants = tenants;
     }
 
     @GetMapping(value = "/.well-known/agent-card.json", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -73,10 +77,11 @@ public class A2aServerController {
             consumes = {MediaType.APPLICATION_JSON_VALUE, "application/a2a+json"},
             produces = MediaType.APPLICATION_JSON_VALUE
     )
-    public Map<String, Object> sendMessage(@RequestBody JsonNode request) {
-        WorkflowView workflow = createWorkflow(request);
+    public Map<String, Object> sendMessage(@RequestBody JsonNode request, HttpServletRequest httpRequest) {
+        String tenantId = tenants.resolve(httpRequest).tenantId();
+        WorkflowView workflow = createWorkflow(tenantId, request);
         boolean returnImmediately = request.path("configuration").path("returnImmediately").asBoolean(false);
-        WorkflowView response = returnImmediately ? workflow : awaitTerminal(workflow.contextId());
+        WorkflowView response = returnImmediately ? workflow : awaitTerminal(tenantId, workflow.contextId());
         return toA2aTask(response);
     }
 
@@ -85,24 +90,25 @@ public class A2aServerController {
             consumes = {MediaType.APPLICATION_JSON_VALUE, "application/a2a+json"},
             produces = MediaType.TEXT_EVENT_STREAM_VALUE
     )
-    public SseEmitter streamMessage(@RequestBody JsonNode request) {
-        WorkflowView workflow = createWorkflow(request);
+    public SseEmitter streamMessage(@RequestBody JsonNode request, HttpServletRequest httpRequest) {
+        String tenantId = tenants.resolve(httpRequest).tenantId();
+        WorkflowView workflow = createWorkflow(tenantId, request);
         SseEmitter emitter = new SseEmitter(blockingTimeout.toMillis());
-        streamExecutor.execute(() -> streamWorkflow(workflow.contextId(), emitter));
+        streamExecutor.execute(() -> streamWorkflow(tenantId, workflow.contextId(), emitter));
         return emitter;
     }
 
     @GetMapping(value = "/a2a/tasks/{taskId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> getTask(@PathVariable String taskId) {
-        return toA2aTask(orchestrator.getByTaskId(taskId));
+    public Map<String, Object> getTask(@PathVariable String taskId, HttpServletRequest request) {
+        return toA2aTask(orchestrator.getByTaskId(tenants.resolve(request).tenantId(), taskId));
     }
 
     @PostMapping(value = "/a2a/tasks/{taskId}:cancel", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> cancelTask(@PathVariable String taskId) {
-        return toA2aTask(orchestrator.cancelByTaskId(taskId));
+    public Map<String, Object> cancelTask(@PathVariable String taskId, HttpServletRequest request) {
+        return toA2aTask(orchestrator.cancelByTaskId(tenants.resolve(request).tenantId(), taskId));
     }
 
-    private WorkflowView createWorkflow(JsonNode request) {
+    private WorkflowView createWorkflow(String tenantId, JsonNode request) {
         JsonNode message = request.path("message");
         String instruction = extractText(message.path("parts"));
         if (instruction.isBlank()) {
@@ -122,18 +128,19 @@ public class A2aServerController {
         String requestedContextId = message.path("contextId").asText("");
         String contextId = requestedContextId.isBlank() ? UUID.randomUUID().toString() : requestedContextId;
         return orchestrator.create(new CreateWorkflowCommand(
+                tenantId,
                 contextId,
                 instruction,
                 List.of(new TaskNodeSpec("delegate", skill, instruction, List.of(), metadata))
         ));
     }
 
-    private void streamWorkflow(String contextId, SseEmitter emitter) {
+    private void streamWorkflow(String tenantId, String contextId, SseEmitter emitter) {
         Instant deadline = Instant.now().plus(blockingTimeout);
         Instant lastUpdate = Instant.EPOCH;
         try {
             while (Instant.now().isBefore(deadline)) {
-                WorkflowView workflow = orchestrator.get(contextId);
+                WorkflowView workflow = orchestrator.get(tenantId, contextId);
                 Instant update = workflow.tasks().stream()
                         .map(TaskView::updatedAt).max(Instant::compareTo).orElse(Instant.EPOCH);
                 if (update.isAfter(lastUpdate)) {
@@ -157,11 +164,11 @@ public class A2aServerController {
         }
     }
 
-    private WorkflowView awaitTerminal(String contextId) {
+    private WorkflowView awaitTerminal(String tenantId, String contextId) {
         Instant deadline = Instant.now().plus(blockingTimeout);
         WorkflowView workflow;
         do {
-            workflow = orchestrator.get(contextId);
+            workflow = orchestrator.get(tenantId, contextId);
             if (workflow.tasks().stream().allMatch(task -> task.state().terminal())) {
                 return workflow;
             }

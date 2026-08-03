@@ -7,6 +7,8 @@ import java.util.List;
 import java.util.Map;
 
 public final class Workflow {
+    private final String tenantId;
+    private final long routingEpoch;
     private final String contextId;
     private final String goal;
     private final Instant createdAt;
@@ -14,10 +16,19 @@ public final class Workflow {
     private long version;
 
     public Workflow(String contextId, String goal, List<TaskNodeSpec> nodes) {
-        this(contextId, goal, Instant.now(), createTasks(contextId, nodes), 0L);
+        this("_default", 1L, contextId, goal, nodes);
     }
 
-    private Workflow(String contextId, String goal, Instant createdAt, Map<String, AgentTask> tasks, long version) {
+    public Workflow(String tenantId, long routingEpoch, String contextId, String goal, List<TaskNodeSpec> nodes) {
+        this(tenantId, routingEpoch, contextId, goal, Instant.now(), createTasks(contextId, nodes), 0L);
+    }
+
+    private Workflow(
+            String tenantId, long routingEpoch, String contextId, String goal,
+            Instant createdAt, Map<String, AgentTask> tasks, long version
+    ) {
+        this.tenantId = tenantId;
+        this.routingEpoch = routingEpoch;
         this.contextId = contextId;
         this.goal = goal;
         this.createdAt = createdAt;
@@ -26,6 +37,8 @@ public final class Workflow {
     }
 
     public static Workflow restore(
+            String tenantId,
+            long routingEpoch,
             String contextId,
             String goal,
             Instant createdAt,
@@ -34,7 +47,7 @@ public final class Workflow {
     ) {
         Map<String, AgentTask> byNode = new LinkedHashMap<>();
         tasks.forEach(task -> byNode.put(task.spec().nodeId(), task));
-        return new Workflow(contextId, goal, createdAt, byNode, version);
+        return new Workflow(tenantId, routingEpoch, contextId, goal, createdAt, byNode, version);
     }
 
     private static Map<String, AgentTask> createTasks(String contextId, List<TaskNodeSpec> nodes) {
@@ -43,6 +56,8 @@ public final class Workflow {
         return byNode;
     }
 
+    public String tenantId() { return tenantId; }
+    public long routingEpoch() { return routingEpoch; }
     public String contextId() { return contextId; }
     public String goal() { return goal; }
     public Instant createdAt() { return createdAt; }

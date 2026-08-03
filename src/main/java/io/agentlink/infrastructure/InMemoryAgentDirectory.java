@@ -14,40 +14,87 @@ import java.time.Duration;
 @Component
 @ConditionalOnProperty(name = "agentlink.persistence.mode", havingValue = "memory", matchIfMissing = true)
 public class InMemoryAgentDirectory implements AgentDirectory {
-    private final ConcurrentHashMap<String, AgentCard> agents = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Registration> agents = new ConcurrentHashMap<>();
 
     @Override
     public void register(AgentCard card) {
-        agents.put(card.id(), card);
+        register("_system", card);
+    }
+
+    @Override
+    public void register(String tenantId, AgentCard card) {
+        agents.put(card.id(), new Registration(tenantId, card));
     }
 
     @Override
     public Optional<AgentCard> select(String skill) {
+        return select("_default", skill);
+    }
+
+    @Override
+    public Optional<AgentCard> select(String tenantId, String skill) {
         return agents.values().stream()
+                .filter(registration -> visible(tenantId, registration))
+                .map(Registration::card)
                 .filter(agent -> agent.supports(skill))
                 .min(Comparator.comparingInt(AgentCard::load).thenComparing(AgentCard::id));
     }
 
     @Override
     public Optional<AgentCard> findById(String agentId) {
-        return Optional.ofNullable(agents.get(agentId));
+        return findById("_default", agentId);
+    }
+
+    @Override
+    public Optional<AgentCard> findById(String tenantId, String agentId) {
+        return Optional.ofNullable(agents.get(agentId))
+                .filter(registration -> visible(tenantId, registration))
+                .map(Registration::card);
     }
 
     @Override
     public List<AgentCard> list() {
-        return agents.values().stream().sorted(Comparator.comparing(AgentCard::id)).toList();
+        return list("_default");
+    }
+
+    @Override
+    public List<AgentCard> list(String tenantId) {
+        return agents.values().stream()
+                .filter(registration -> visible(tenantId, registration))
+                .map(Registration::card)
+                .sorted(Comparator.comparing(AgentCard::id)).toList();
     }
 
     @Override
     public boolean heartbeat(String agentId, boolean healthy, int load, Duration ttl) {
-        return agents.computeIfPresent(agentId, (ignored, card) -> new AgentCard(
-                card.id(), card.name(), card.endpoint(), card.protocolVersion(), card.skills(), healthy, load,
-                card.streaming()
-        )) != null;
+        return heartbeat("_system", agentId, healthy, load, ttl);
+    }
+
+    @Override
+    public boolean heartbeat(String tenantId, String agentId, boolean healthy, int load, Duration ttl) {
+        return agents.computeIfPresent(agentId, (ignored, registration) ->
+                registration.tenantId().equals(tenantId) ? new Registration(tenantId, new AgentCard(
+                        registration.card().id(), registration.card().name(), registration.card().endpoint(),
+                        registration.card().protocolVersion(), registration.card().skills(), healthy, load,
+                        registration.card().streaming()
+                )) : registration) != null && agents.get(agentId).tenantId().equals(tenantId);
     }
 
     @Override
     public boolean unregister(String agentId) {
-        return agents.remove(agentId) != null;
+        return unregister("_system", agentId);
+    }
+
+    @Override
+    public boolean unregister(String tenantId, String agentId) {
+        Registration existing = agents.get(agentId);
+        return existing != null && existing.tenantId().equals(tenantId) && agents.remove(agentId, existing);
+    }
+
+    private boolean visible(String tenantId, Registration registration) {
+        return registration.tenantId().equals("_system") || registration.tenantId().equals(tenantId);
+    }
+
+    private record Registration(String tenantId, AgentCard card) {
     }
 }

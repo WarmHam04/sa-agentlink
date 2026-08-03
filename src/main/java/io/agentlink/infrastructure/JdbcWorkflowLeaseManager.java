@@ -6,6 +6,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.sql.Timestamp;
 import java.time.Duration;
@@ -18,9 +20,19 @@ import java.util.Objects;
 public class JdbcWorkflowLeaseManager implements WorkflowLeaseManager {
     private final JdbcTemplate jdbcTemplate;
     private final boolean postgres;
+    private final String region;
 
     public JdbcWorkflowLeaseManager(JdbcTemplate jdbcTemplate) {
+        this(jdbcTemplate, "local");
+    }
+
+    @Autowired
+    public JdbcWorkflowLeaseManager(
+            JdbcTemplate jdbcTemplate,
+            @Value("${agentlink.region:${AGENTLINK_REGION:local}}") String region
+    ) {
         this.jdbcTemplate = jdbcTemplate;
+        this.region = region;
         try (var connection = Objects.requireNonNull(jdbcTemplate.getDataSource()).getConnection()) {
             this.postgres = connection.getMetaData().getDatabaseProductName().toLowerCase().contains("postgresql");
         } catch (Exception failure) {
@@ -31,6 +43,9 @@ public class JdbcWorkflowLeaseManager implements WorkflowLeaseManager {
     @Override
     @Transactional
     public Optional<WorkflowLease> acquire(String contextId, String ownerId, Duration ttl) {
+        if (!writableInThisRegion(contextId)) {
+            return Optional.empty();
+        }
         Instant now = databaseNow();
         Instant until = now.plus(ttl);
         int inserted = insertIfAbsent(contextId, ownerId, until, now);
@@ -60,9 +75,18 @@ public class JdbcWorkflowLeaseManager implements WorkflowLeaseManager {
                 UPDATE agentlink_workflow_lease
                 SET lease_until = ?, updated_at = ?
                 WHERE context_id = ? AND owner_id = ? AND fencing_token = ? AND lease_until > ?
+                  AND EXISTS (
+                      SELECT 1 FROM agentlink_workflow workflow
+                      LEFT JOIN agentlink_tenant_policy policy ON policy.tenant_id = workflow.tenant_id
+                      WHERE workflow.context_id = agentlink_workflow_lease.context_id
+                        AND (policy.tenant_id IS NULL OR (
+                            policy.enabled = TRUE AND policy.home_region = ?
+                            AND policy.routing_epoch = workflow.routing_epoch
+                        ))
+                  )
                 """,
                 Timestamp.from(until), Timestamp.from(now), lease.contextId(), lease.ownerId(),
-                lease.fencingToken(), Timestamp.from(now)
+                lease.fencingToken(), Timestamp.from(now), region
         );
         return updated == 1 ? Optional.of(new WorkflowLease(
                 lease.contextId(), lease.ownerId(), lease.fencingToken(), until
@@ -106,6 +130,22 @@ public class JdbcWorkflowLeaseManager implements WorkflowLeaseManager {
                 ),
                 contextId
         ).stream().findFirst();
+    }
+
+    private boolean writableInThisRegion(String contextId) {
+        Integer count = jdbcTemplate.queryForObject(
+                """
+                SELECT COUNT(*) FROM agentlink_workflow workflow
+                LEFT JOIN agentlink_tenant_policy policy ON policy.tenant_id = workflow.tenant_id
+                WHERE workflow.context_id = ?
+                  AND (policy.tenant_id IS NULL OR (
+                      policy.enabled = TRUE AND policy.home_region = ?
+                      AND policy.routing_epoch = workflow.routing_epoch
+                  ))
+                """,
+                Integer.class, contextId, region
+        );
+        return count != null && count == 1;
     }
 
     private Instant databaseNow() {

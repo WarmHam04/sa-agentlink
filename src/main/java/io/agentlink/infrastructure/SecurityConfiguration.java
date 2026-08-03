@@ -28,6 +28,7 @@ public class SecurityConfiguration {
                         .requestMatchers("/.well-known/agent-card.json", "/actuator/health/**", "/actuator/info")
                         .permitAll()
                         .requestMatchers("/actuator/prometheus").hasAuthority("SCOPE_agentlink.metrics")
+                        .requestMatchers("/api/v1/admin/**").hasAuthority("SCOPE_agentlink.admin")
                         .requestMatchers(HttpMethod.GET, "/api/v1/agents/**")
                         .hasAuthority("SCOPE_agentlink.agents.read")
                         .requestMatchers("/api/v1/agents/**").hasAuthority("SCOPE_agentlink.agents.write")

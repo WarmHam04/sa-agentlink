@@ -13,5 +13,11 @@ public interface WorkflowStore {
     }
     Optional<Workflow> find(String contextId);
     Optional<Workflow> findByTaskId(String taskId);
+    default Optional<Workflow> findForTenant(String tenantId, String contextId) {
+        return find(contextId).filter(workflow -> workflow.tenantId().equals(tenantId));
+    }
+    default Optional<Workflow> findByTaskIdForTenant(String tenantId, String taskId) {
+        return findByTaskId(taskId).filter(workflow -> workflow.tenantId().equals(tenantId));
+    }
     List<Workflow> findNonTerminal();
 }

@@ -48,7 +48,7 @@ public class JdbcWorkflowStore implements WorkflowStore {
         int inserted = insertWorkflow(workflow, snapshot);
         if (inserted == 1) {
             syncTasks(workflow);
-            writeOutbox(workflow.contextId(), "workflow.created", snapshot);
+            writeOutbox(workflow.tenantId(), workflow.contextId(), "workflow.created", snapshot);
             return workflow;
         }
         return find(workflow.contextId())
@@ -58,11 +58,13 @@ public class JdbcWorkflowStore implements WorkflowStore {
     private int insertWorkflow(Workflow workflow, String snapshot) {
         String baseSql = """
                 INSERT INTO agentlink_workflow
-                    (context_id, goal, definition_hash, snapshot_json, created_at, updated_at, version)
-                VALUES (?, ?, ?, ?, ?, ?, 0)
+                    (context_id, tenant_id, routing_epoch, goal, definition_hash, snapshot_json,
+                     created_at, updated_at, version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """;
         Object[] arguments = {
-                workflow.contextId(), workflow.goal(), definitionHash(workflow), snapshot,
+                workflow.contextId(), workflow.tenantId(), workflow.routingEpoch(),
+                workflow.goal(), definitionHash(workflow), snapshot,
                 Timestamp.from(workflow.createdAt()), Timestamp.from(Instant.now())
         };
         if (postgres) {
@@ -93,12 +95,13 @@ public class JdbcWorkflowStore implements WorkflowStore {
         String sql = """
                 UPDATE agentlink_workflow
                 SET snapshot_json = ?, updated_at = ?, version = version + 1
-                WHERE context_id = ? AND version = ?
+                WHERE context_id = ? AND tenant_id = ? AND routing_epoch = ? AND version = ?
                 """;
         Object[] arguments;
         if (lease == null) {
             arguments = new Object[]{
-                    snapshot, Timestamp.from(Instant.now()), workflow.contextId(), expectedVersion
+                    snapshot, Timestamp.from(Instant.now()), workflow.contextId(), workflow.tenantId(),
+                    workflow.routingEpoch(), expectedVersion
             };
         } else {
             sql += """
@@ -110,7 +113,8 @@ public class JdbcWorkflowStore implements WorkflowStore {
                      )
                     """;
             arguments = new Object[]{
-                    snapshot, Timestamp.from(Instant.now()), workflow.contextId(), expectedVersion,
+                    snapshot, Timestamp.from(Instant.now()), workflow.contextId(), workflow.tenantId(),
+                    workflow.routingEpoch(), expectedVersion,
                     lease.ownerId(), lease.fencingToken()
             };
         }
@@ -123,17 +127,32 @@ public class JdbcWorkflowStore implements WorkflowStore {
             throw new WorkflowOptimisticLockException(workflow.contextId(), expectedVersion);
         }
         syncTasks(workflow);
-        writeOutbox(workflow.contextId(), "workflow.snapshot.updated", snapshot);
+        writeOutbox(workflow.tenantId(), workflow.contextId(), "workflow.snapshot.updated", snapshot);
         workflow.markPersisted(expectedVersion, expectedVersion + 1);
     }
 
     @Override
     public Optional<Workflow> find(String contextId) {
         return jdbcTemplate.query(
-                "SELECT snapshot_json, version FROM agentlink_workflow WHERE context_id = ?",
+                "SELECT snapshot_json, version, tenant_id, routing_epoch FROM agentlink_workflow WHERE context_id = ?",
                 (resultSet, row) -> deserialize(resultSet.getString("snapshot_json"))
-                        .restore(resultSet.getLong("version")),
+                        .restore(resultSet.getLong("version"), resultSet.getString("tenant_id"),
+                                resultSet.getLong("routing_epoch")),
                 contextId
+        ).stream().findFirst();
+    }
+
+    @Override
+    public Optional<Workflow> findForTenant(String tenantId, String contextId) {
+        return jdbcTemplate.query(
+                """
+                SELECT snapshot_json, version, tenant_id, routing_epoch
+                FROM agentlink_workflow WHERE tenant_id = ? AND context_id = ?
+                """,
+                (resultSet, row) -> deserialize(resultSet.getString("snapshot_json"))
+                        .restore(resultSet.getLong("version"), resultSet.getString("tenant_id"),
+                                resultSet.getLong("routing_epoch")),
+                tenantId, contextId
         ).stream().findFirst();
     }
 
@@ -141,14 +160,31 @@ public class JdbcWorkflowStore implements WorkflowStore {
     public Optional<Workflow> findByTaskId(String taskId) {
         return jdbcTemplate.query(
                 """
-                SELECT w.snapshot_json, w.version
+                SELECT w.snapshot_json, w.version, w.tenant_id, w.routing_epoch
                 FROM agentlink_task t
                 JOIN agentlink_workflow w ON w.context_id = t.context_id
                 WHERE t.task_id = ?
                 """,
                 (resultSet, row) -> deserialize(resultSet.getString("snapshot_json"))
-                        .restore(resultSet.getLong("version")),
+                        .restore(resultSet.getLong("version"), resultSet.getString("tenant_id"),
+                                resultSet.getLong("routing_epoch")),
                 taskId
+        ).stream().findFirst();
+    }
+
+    @Override
+    public Optional<Workflow> findByTaskIdForTenant(String tenantId, String taskId) {
+        return jdbcTemplate.query(
+                """
+                SELECT w.snapshot_json, w.version, w.tenant_id, w.routing_epoch
+                FROM agentlink_task t
+                JOIN agentlink_workflow w ON w.context_id = t.context_id
+                WHERE t.tenant_id = ? AND t.task_id = ? AND w.tenant_id = ?
+                """,
+                (resultSet, row) -> deserialize(resultSet.getString("snapshot_json"))
+                        .restore(resultSet.getLong("version"), resultSet.getString("tenant_id"),
+                                resultSet.getLong("routing_epoch")),
+                tenantId, taskId, tenantId
         ).stream().findFirst();
     }
 
@@ -156,7 +192,7 @@ public class JdbcWorkflowStore implements WorkflowStore {
     public List<Workflow> findNonTerminal() {
         return jdbcTemplate.query(
                 """
-                SELECT w.snapshot_json, w.version
+                SELECT w.snapshot_json, w.version, w.tenant_id, w.routing_epoch
                 FROM agentlink_workflow w
                 WHERE NOT EXISTS (
                     SELECT 1 FROM agentlink_task t WHERE t.context_id = w.context_id
@@ -168,7 +204,8 @@ public class JdbcWorkflowStore implements WorkflowStore {
                 ORDER BY w.created_at
                 """,
                 (resultSet, row) -> deserialize(resultSet.getString("snapshot_json"))
-                        .restore(resultSet.getLong("version"))
+                        .restore(resultSet.getLong("version"), resultSet.getString("tenant_id"),
+                                resultSet.getLong("routing_epoch"))
         ).stream()
                 .filter(workflow -> workflow.tasks().stream().anyMatch(task -> !task.state().terminal()))
                 .toList();
@@ -178,7 +215,7 @@ public class JdbcWorkflowStore implements WorkflowStore {
     public int backfillTaskIndex() {
         List<Workflow> missing = jdbcTemplate.query(
                 """
-                SELECT w.snapshot_json, w.version
+                SELECT w.snapshot_json, w.version, w.tenant_id, w.routing_epoch
                 FROM agentlink_workflow w
                 WHERE NOT EXISTS (
                     SELECT 1 FROM agentlink_task t WHERE t.context_id = w.context_id
@@ -186,7 +223,8 @@ public class JdbcWorkflowStore implements WorkflowStore {
                 ORDER BY w.created_at
                 """,
                 (resultSet, row) -> deserialize(resultSet.getString("snapshot_json"))
-                        .restore(resultSet.getLong("version"))
+                        .restore(resultSet.getLong("version"), resultSet.getString("tenant_id"),
+                                resultSet.getLong("routing_epoch"))
         );
         missing.forEach(this::syncTasks);
         return missing.size();
@@ -201,21 +239,22 @@ public class JdbcWorkflowStore implements WorkflowStore {
                     UPDATE agentlink_task
                     SET state = ?, agent_id = ?, artifact_id = ?, error = ?, spec_json = ?,
                         artifact_json = ?, updated_at = ?
-                    WHERE task_id = ?
+                    WHERE task_id = ? AND tenant_id = ?
                     """,
                     task.state().name(), task.agentId(),
                     task.artifact() == null ? null : task.artifact().id(), task.error(), spec, artifact,
-                    Timestamp.from(task.updatedAt()), task.id()
+                    Timestamp.from(task.updatedAt()), task.id(), workflow.tenantId()
             );
             if (updated == 0) {
                 jdbcTemplate.update(
                         """
                         INSERT INTO agentlink_task
-                            (task_id, context_id, node_id, skill, state, agent_id, artifact_id, error,
-                             spec_json, artifact_json, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (task_id, context_id, tenant_id, node_id, skill, state, agent_id, artifact_id,
+                             error, spec_json, artifact_json, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        task.id(), workflow.contextId(), task.spec().nodeId(), task.spec().skill(),
+                        task.id(), workflow.contextId(), workflow.tenantId(),
+                        task.spec().nodeId(), task.spec().skill(),
                         task.state().name(), task.agentId(),
                         task.artifact() == null ? null : task.artifact().id(), task.error(), spec, artifact,
                         Timestamp.from(task.createdAt()), Timestamp.from(task.updatedAt())
@@ -224,14 +263,14 @@ public class JdbcWorkflowStore implements WorkflowStore {
         }
     }
 
-    private void writeOutbox(String aggregateId, String eventType, String payload) {
+    private void writeOutbox(String tenantId, String aggregateId, String eventType, String payload) {
         jdbcTemplate.update(
                 """
                 INSERT INTO agentlink_outbox
-                    (aggregate_type, aggregate_id, event_type, payload_json, created_at)
-                VALUES ('workflow', ?, ?, ?, ?)
+                    (tenant_id, aggregate_type, aggregate_id, event_type, payload_json, created_at)
+                VALUES (?, 'workflow', ?, ?, ?, ?)
                 """,
-                aggregateId, eventType, payload, Timestamp.from(Instant.now())
+                tenantId, aggregateId, eventType, payload, Timestamp.from(Instant.now())
         );
     }
 

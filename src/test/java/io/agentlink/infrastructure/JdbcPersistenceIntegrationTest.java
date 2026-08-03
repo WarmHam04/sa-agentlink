@@ -8,6 +8,7 @@ import io.agentlink.domain.TaskNodeSpec;
 import io.agentlink.domain.TaskState;
 import io.agentlink.domain.Workflow;
 import io.agentlink.application.WorkflowRecoveryService;
+import io.agentlink.application.TenantPolicy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
@@ -39,7 +40,9 @@ class JdbcPersistenceIntegrationTest {
                 new ClassPathResource("db/migration/V2__cluster_execution_model.sql"),
                 new ClassPathResource("db/migration/V3__cluster_agent_registry.sql"),
                 new ClassPathResource("db/migration/V4__agent_streaming_capability.sql"),
-                new ClassPathResource("db/migration/V5__outbox_claims.sql")
+                new ClassPathResource("db/migration/V5__outbox_claims.sql"),
+                new ClassPathResource("db/migration/V6__tenant_control_plane.sql"),
+                new ClassPathResource("db/migration/V7__outbox_dead_letter.sql")
         )
                 .execute(dataSource);
         jdbcTemplate = new JdbcTemplate(dataSource);
@@ -114,7 +117,10 @@ class JdbcPersistenceIntegrationTest {
 
         new WorkflowRecoveryService(
                 store, eventBus, new JdbcWorkflowLeaseManager(jdbcTemplate),
-                true, "recovery-test", Duration.ofSeconds(30)
+                true, "recovery-test", Duration.ofSeconds(30),
+                new JdbcTenantControlPlane(
+                        jdbcTemplate, "local", 600, 10000, 100, Duration.ofMinutes(15)
+                )
         ).run(null);
 
         Workflow recovered = store.find("restart-context").orElseThrow();
@@ -206,6 +212,107 @@ class JdbcPersistenceIntegrationTest {
         ));
         assertThat(secondNode.findById("remote-reviewer")).map(io.agentlink.domain.AgentCard::name)
                 .contains("Replacement");
+    }
+
+    @Test
+    void isolatesTenantsAndFencesTheOldRegionAfterFailover() {
+        JdbcTenantControlPlane east = new JdbcTenantControlPlane(
+                jdbcTemplate, "east", 2, 10, 1, Duration.ofMinutes(15)
+        );
+        assertThat(east.policyForWrite("tenant-a").homeRegion()).isEqualTo("east");
+        east.admitRequest("tenant-a", "get-workflows");
+        east.admitRequest("tenant-a", "get-workflows");
+        assertThatThrownBy(() -> east.admitRequest("tenant-a", "get-workflows"))
+                .isInstanceOf(io.agentlink.application.TenantQuotaExceededException.class);
+
+        long epoch = east.admitWorkflow("tenant-a", "tenant-workflow-a");
+        assertThatThrownBy(() -> east.admitWorkflow("tenant-a", "tenant-workflow-b"))
+                .isInstanceOf(io.agentlink.application.TenantQuotaExceededException.class);
+
+        JdbcWorkflowStore store = new JdbcWorkflowStore(jdbcTemplate, objectMapper);
+        Workflow workflow = new Workflow(
+                "tenant-a", epoch, "tenant-workflow-a", "regional work",
+                List.of(new TaskNodeSpec("work", "analysis", "work", List.of(), Map.of()))
+        );
+        store.saveIfAbsent(workflow);
+        assertThat(store.findForTenant("tenant-a", workflow.contextId())).isPresent();
+        assertThat(store.findForTenant("tenant-b", workflow.contextId())).isEmpty();
+
+        JdbcWorkflowLeaseManager eastLeases = new JdbcWorkflowLeaseManager(jdbcTemplate, "east");
+        var staleLease = eastLeases.acquire(
+                workflow.contextId(), "east-node", Duration.ofSeconds(30)
+        ).orElseThrow();
+        TenantPolicy failedOver = new JdbcTenantAdministration(jdbcTemplate, east)
+                .failover("tenant-a", "west", epoch);
+        assertThat(failedOver.routingEpoch()).isEqualTo(epoch + 1);
+        assertThat(eastLeases.renew(staleLease, Duration.ofSeconds(30))).isEmpty();
+        assertThat(eastLeases.acquire(workflow.contextId(), "east-node", Duration.ofSeconds(30))).isEmpty();
+        assertThat(new JdbcWorkflowLeaseManager(jdbcTemplate, "west")
+                .acquire(workflow.contextId(), "west-node", Duration.ofSeconds(30))).isPresent();
+    }
+
+    @Test
+    void deadLettersExhaustedOutboxMessagesAndSupportsTenantScopedReplay() {
+        JdbcWorkflowStore store = new JdbcWorkflowStore(jdbcTemplate, objectMapper);
+        Workflow workflow = new Workflow(
+                "tenant-dlq", 1L, "dlq-context", "deliver once",
+                List.of(new TaskNodeSpec("work", "analysis", "work", List.of(), Map.of()))
+        );
+        store.saveIfAbsent(workflow);
+        JdbcOutboxRelay failing = new JdbcOutboxRelay(
+                jdbcTemplate,
+                List.of(message -> { throw new IllegalStateException("broker unavailable"); }),
+                "relay-a", Duration.ofSeconds(30), 3, Duration.ZERO, Duration.ZERO
+        );
+        failing.relay();
+        failing.relay();
+        failing.relay();
+
+        JdbcOutboxDeadLetterService deadLetters = new JdbcOutboxDeadLetterService(jdbcTemplate);
+        var dead = deadLetters.list("tenant-dlq", 10);
+        assertThat(dead).hasSize(1);
+        assertThat(dead.get(0).attemptCount()).isEqualTo(3);
+        assertThat(dead.get(0).reason()).contains("broker unavailable");
+        assertThat(deadLetters.list("other-tenant", 10)).isEmpty();
+
+        assertThat(deadLetters.replay("tenant-dlq", dead.get(0).id())).isTrue();
+        new JdbcOutboxRelay(
+                jdbcTemplate, List.of(message -> { }), "relay-b", Duration.ofSeconds(30),
+                3, Duration.ZERO, Duration.ZERO
+        ).relay();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agentlink_outbox WHERE published_at IS NOT NULL",
+                Integer.class
+        )).isEqualTo(1);
+    }
+
+    @Test
+    void removesExpiredTenantReservationsAndRateBuckets() {
+        JdbcTenantControlPlane controlPlane = new JdbcTenantControlPlane(
+                jdbcTemplate, "local", 10, 10, 10, Duration.ofMinutes(15)
+        );
+        controlPlane.admitRequest("tenant-maintenance", "get-workflows");
+        controlPlane.admitWorkflow("tenant-maintenance", "expired-workflow");
+        java.sql.Timestamp expired = java.sql.Timestamp.from(Instant.now().minus(Duration.ofDays(3)));
+        jdbcTemplate.update(
+                "UPDATE agentlink_tenant_rate_bucket SET bucket_start = ? WHERE tenant_id = ?",
+                expired, "tenant-maintenance"
+        );
+        jdbcTemplate.update(
+                "UPDATE agentlink_tenant_workflow_reservation SET expires_at = ? WHERE tenant_id = ?",
+                expired, "tenant-maintenance"
+        );
+
+        new JdbcTenantMaintenance(jdbcTemplate, Duration.ofDays(2)).cleanup();
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agentlink_tenant_rate_bucket WHERE tenant_id = ?",
+                Integer.class, "tenant-maintenance"
+        )).isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agentlink_tenant_workflow_reservation WHERE tenant_id = ?",
+                Integer.class, "tenant-maintenance"
+        )).isZero();
     }
 
     private TaskEvent event(String taskId, String message, TaskState state) {

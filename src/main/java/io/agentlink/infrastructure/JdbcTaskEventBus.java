@@ -43,18 +43,19 @@ public class JdbcTaskEventBus implements TaskEventBus {
             PreparedStatement statement = connection.prepareStatement(
                     """
                     INSERT INTO agentlink_task_event
-                        (context_id, task_id, node_id, state, message, artifact_id, event_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (tenant_id, context_id, task_id, node_id, state, message, artifact_id, event_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     new String[]{"event_offset"}
             );
-            statement.setString(1, event.contextId());
-            statement.setString(2, event.taskId());
-            statement.setString(3, event.nodeId());
-            statement.setString(4, event.state().name());
-            statement.setString(5, event.message());
-            statement.setString(6, event.artifactId());
-            statement.setTimestamp(7, Timestamp.from(event.timestamp()));
+            statement.setString(1, event.tenantId());
+            statement.setString(2, event.contextId());
+            statement.setString(3, event.taskId());
+            statement.setString(4, event.nodeId());
+            statement.setString(5, event.state().name());
+            statement.setString(6, event.message());
+            statement.setString(7, event.artifactId());
+            statement.setTimestamp(8, Timestamp.from(event.timestamp()));
             return statement;
         }, keyHolder);
         Number key = Objects.requireNonNull(keyHolder.getKey(), "database did not return event offset");
@@ -62,10 +63,10 @@ public class JdbcTaskEventBus implements TaskEventBus {
         jdbcTemplate.update(
                 """
                 INSERT INTO agentlink_outbox
-                    (aggregate_type, aggregate_id, event_type, payload_json, created_at)
-                VALUES ('task', ?, 'task.event', ?, ?)
+                    (tenant_id, aggregate_type, aggregate_id, event_type, payload_json, created_at)
+                VALUES (?, 'task', ?, 'task.event', ?, ?)
                 """,
-                event.taskId(), serialize(persisted), Timestamp.from(Instant.now())
+                event.tenantId(), event.taskId(), serialize(persisted), Timestamp.from(Instant.now())
         );
         subscribers.getOrDefault(event.contextId(), new CopyOnWriteArrayList<>())
                 .removeIf(emitter -> !send(emitter, persisted));
@@ -74,6 +75,11 @@ public class JdbcTaskEventBus implements TaskEventBus {
 
     @Override
     public SseEmitter subscribe(String contextId, long afterOffset) {
+        return subscribe("_default", contextId, afterOffset);
+    }
+
+    @Override
+    public SseEmitter subscribe(String tenantId, String contextId, long afterOffset) {
         SseEmitter emitter = new SseEmitter(0L);
         CopyOnWriteArrayList<SseEmitter> contextSubscribers =
                 subscribers.computeIfAbsent(contextId, ignored -> new CopyOnWriteArrayList<>());
@@ -81,20 +87,25 @@ public class JdbcTaskEventBus implements TaskEventBus {
         emitter.onCompletion(() -> contextSubscribers.remove(emitter));
         emitter.onTimeout(() -> contextSubscribers.remove(emitter));
         emitter.onError(ignored -> contextSubscribers.remove(emitter));
-        replay(contextId, afterOffset).forEach(event -> send(emitter, event));
+        replay(tenantId, contextId, afterOffset).forEach(event -> send(emitter, event));
         return emitter;
     }
 
     public List<TaskEvent> replay(String contextId, long afterOffset) {
+        return replay("_default", contextId, afterOffset);
+    }
+
+    public List<TaskEvent> replay(String tenantId, String contextId, long afterOffset) {
         return jdbcTemplate.query(
                 """
-                SELECT event_offset, context_id, task_id, node_id, state, message, artifact_id, event_time
+                SELECT event_offset, tenant_id, context_id, task_id, node_id, state, message, artifact_id, event_time
                 FROM agentlink_task_event
-                WHERE context_id = ? AND event_offset > ?
+                WHERE tenant_id = ? AND context_id = ? AND event_offset > ?
                 ORDER BY event_offset
                 """,
                 (resultSet, row) -> new TaskEvent(
                         resultSet.getLong("event_offset"),
+                        resultSet.getString("tenant_id"),
                         resultSet.getString("context_id"),
                         resultSet.getString("task_id"),
                         resultSet.getString("node_id"),
@@ -103,7 +114,7 @@ public class JdbcTaskEventBus implements TaskEventBus {
                         resultSet.getString("artifact_id"),
                         resultSet.getTimestamp("event_time").toInstant()
                 ),
-                contextId, afterOffset
+                tenantId, contextId, afterOffset
         );
     }
 

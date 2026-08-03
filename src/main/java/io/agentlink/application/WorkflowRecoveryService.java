@@ -20,6 +20,7 @@ public class WorkflowRecoveryService implements ApplicationRunner {
     private final WorkflowLeaseManager leaseManager;
     private final String instanceId;
     private final Duration leaseTtl;
+    private final TenantControlPlane tenantControlPlane;
 
     public WorkflowRecoveryService(
             WorkflowStore store,
@@ -27,7 +28,8 @@ public class WorkflowRecoveryService implements ApplicationRunner {
             WorkflowLeaseManager leaseManager,
             @Value("${agentlink.persistence.fail-interrupted-on-startup:true}") boolean enabled,
             @Value("${agentlink.cluster.instance-id:${random.uuid}}") String instanceId,
-            @Value("${agentlink.cluster.workflow-lease-ttl:PT30S}") Duration leaseTtl
+            @Value("${agentlink.cluster.workflow-lease-ttl:PT30S}") Duration leaseTtl,
+            TenantControlPlane tenantControlPlane
     ) {
         this.store = store;
         this.eventBus = eventBus;
@@ -35,6 +37,7 @@ public class WorkflowRecoveryService implements ApplicationRunner {
         this.leaseManager = leaseManager;
         this.instanceId = instanceId;
         this.leaseTtl = leaseTtl;
+        this.tenantControlPlane = tenantControlPlane;
     }
 
     @Override
@@ -55,12 +58,14 @@ public class WorkflowRecoveryService implements ApplicationRunner {
                                 String reason = "execution interrupted by service restart; safe replay requires a new task";
                                 task.transition(TaskState.FAILED, reason);
                                 eventBus.publish(new TaskEvent(
-                                        0L, workflow.contextId(), task.id(), task.spec().nodeId(), task.state(),
+                                        0L, workflow.tenantId(), workflow.contextId(), task.id(),
+                                        task.spec().nodeId(), task.state(),
                                         reason, null, Instant.now()
                                 ));
                             });
                     store.save(workflow, lease);
                 }
+                tenantControlPlane.releaseWorkflow(workflow.tenantId(), workflow.contextId());
             } finally {
                 leaseManager.release(lease);
             }

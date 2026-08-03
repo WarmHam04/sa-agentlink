@@ -26,6 +26,7 @@ services:
       AGENTLINK_JDBC_USERNAME: agentlink
       AGENTLINK_JDBC_PASSWORD: agentlink
       AGENTLINK_INSTANCE_ID: compose-1
+      AGENTLINK_REGION: local
       AGENTLINK_WORKSPACE_ROOT: /workspace
       OTEL_TRACES_EXPORTER: none
     ports:
@@ -45,6 +46,7 @@ services:
       AGENTLINK_JDBC_USERNAME: agentlink
       AGENTLINK_JDBC_PASSWORD: agentlink
       AGENTLINK_INSTANCE_ID: compose-2
+      AGENTLINK_REGION: local
       AGENTLINK_WORKSPACE_ROOT: /workspace
       AGENTLINK_PUBLIC_BASE_URL: http://localhost:8097
       OTEL_TRACES_EXPORTER: none

@@ -22,6 +22,11 @@ public record CreateWorkflowRequest(
         );
     }
 
+    public CreateWorkflowCommand toCommand(String tenantId) {
+        CreateWorkflowCommand command = toCommand();
+        return new CreateWorkflowCommand(tenantId, command.contextId(), command.goal(), command.nodes());
+    }
+
     public record NodeRequest(
             @NotBlank String nodeId,
             @NotBlank String skill,

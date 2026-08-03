@@ -41,6 +41,11 @@ public class InMemoryTaskEventBus implements TaskEventBus {
 
     @Override
     public SseEmitter subscribe(String contextId, long afterOffset) {
+        return subscribe("_default", contextId, afterOffset);
+    }
+
+    @Override
+    public SseEmitter subscribe(String tenantId, String contextId, long afterOffset) {
         SseEmitter emitter = new SseEmitter(0L);
         CopyOnWriteArrayList<SseEmitter> contextSubscribers =
                 subscribers.computeIfAbsent(contextId, ignored -> new CopyOnWriteArrayList<>());
@@ -50,6 +55,7 @@ public class InMemoryTaskEventBus implements TaskEventBus {
         emitter.onError(ignored -> contextSubscribers.remove(emitter));
 
         List<TaskEvent> replay = history.getOrDefault(contextId, new CopyOnWriteArrayList<>()).stream()
+                .filter(event -> event.tenantId().equals(tenantId))
                 .filter(event -> event.offset() > afterOffset)
                 .toList();
         replay.forEach(event -> send(emitter, event));

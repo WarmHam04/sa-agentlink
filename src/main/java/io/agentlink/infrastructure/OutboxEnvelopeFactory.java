@@ -20,6 +20,7 @@ public class OutboxEnvelopeFactory {
         try {
             Map<String, Object> envelope = new LinkedHashMap<>();
             envelope.put("id", message.id());
+            envelope.put("tenantId", message.tenantId());
             envelope.put("aggregateType", message.aggregateType());
             envelope.put("aggregateId", message.aggregateId());
             envelope.put("eventType", message.eventType());

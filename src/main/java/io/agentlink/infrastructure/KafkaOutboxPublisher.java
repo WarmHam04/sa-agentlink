@@ -41,6 +41,8 @@ public class KafkaOutboxPublisher implements OutboxPublisher {
                         new RecordHeader("agentlink-outbox-id", Long.toString(message.id())
                                 .getBytes(StandardCharsets.UTF_8)),
                         new RecordHeader("agentlink-event-type", message.eventType()
+                                .getBytes(StandardCharsets.UTF_8)),
+                        new RecordHeader("agentlink-tenant-id", message.tenantId()
                                 .getBytes(StandardCharsets.UTF_8))
                 )
         );

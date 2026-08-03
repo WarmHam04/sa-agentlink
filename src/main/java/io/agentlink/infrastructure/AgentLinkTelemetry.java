@@ -27,9 +27,14 @@ public class AgentLinkTelemetry {
     }
 
     public void startWorkflow(String contextId, String goal, int taskCount) {
+        startWorkflow("_default", contextId, goal, taskCount);
+    }
+
+    public void startWorkflow(String tenantId, String contextId, String goal, int taskCount) {
         Span span = tracer.spanBuilder("agentlink.workflow")
                 .setSpanKind(SpanKind.INTERNAL)
                 .setAttribute("agentlink.context.id", contextId)
+                .setAttribute("agentlink.tenant.id", tenantId)
                 .setAttribute("agentlink.workflow.goal", goal)
                 .setAttribute("agentlink.workflow.task_count", taskCount)
                 .startSpan();

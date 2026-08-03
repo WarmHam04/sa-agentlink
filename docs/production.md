@@ -23,6 +23,10 @@ Agent registrations are soft state. Nodes heartbeat their owned cards, and expir
 
 Outbox delivery is at-least-once. PostgreSQL claims use `FOR UPDATE SKIP LOCKED`; each record includes its Outbox ID as an idempotency key or broker header. A consumer must persist that ID before applying non-idempotent effects.
 
+Tenant policy is also coordinated in PostgreSQL. JWT tenant claims scope durable resources and private Agent registrations. Workflow reservations serialize through a locked tenant-policy row, expire if abandoned, and are renewed with the Workflow lease. Fixed-window counters enforce request and daily Workflow limits across replicas.
+
+Expired reservations and rate buckets are removed by periodic JDBC maintenance. Keep rate-bucket retention longer than the longest quota window used by the deployment.
+
 ## OAuth2 scopes
 
 | Scope | Access |
@@ -33,12 +37,15 @@ Outbox delivery is at-least-once. PostgreSQL claims use `FOR UPDATE SKIP LOCKED`
 | `agentlink.agents.read` | List/read registered Agents |
 | `agentlink.agents.write` | Register, discover, heartbeat, or remove Agents |
 | `agentlink.metrics` | Read Prometheus metrics |
+| `agentlink.admin` | Tenant policy, regional failover, and DLQ operations |
 
-The issuer's JWT must expose scopes using Spring Security's standard `scope` or `scp` claims. Network policy should separately restrict PostgreSQL, broker, actuator, and outbound Agent traffic.
+The issuer's JWT must expose scopes using Spring Security's standard `scope` or `scp` claims and a tenant claim (default `tenant_id`). Network policy should separately restrict PostgreSQL, broker, actuator, and outbound Agent traffic.
 
 ## Broker delivery
 
 Configure only the publishers required by the deployment. If more than one is enabled, an Outbox row is marked published only after every configured publisher acknowledges it. A partial success can be delivered again after retry, which is why deduplication remains mandatory.
+
+After bounded exponential retries, failed rows enter the tenant-scoped DLQ. Alert on DLQ growth and use explicit administrator replay only after the downstream cause has been corrected.
 
 Kafka configuration uses Spring Boot's `spring.kafka.*` properties and `agentlink.outbox.kafka.topic`. RocketMQ uses the official 5.x gRPC client with `agentlink.outbox.rocketmq.*`. Secrets should come from the platform secret store rather than source-controlled configuration.
 
@@ -46,7 +53,7 @@ Kafka configuration uses Spring Boot's `spring.kafka.*` properties and `agentlin
 
 Workflow and Task spans include Context ID, Task ID, node, Skill, selected Agent, state, runtime events, failures, and lease-loss events. Outbound A2A requests carry W3C trace context. Set the standard `OTEL_EXPORTER_OTLP_*` variables to use an OpenTelemetry Collector; keep exporters disabled in unit tests and local runs that do not have a collector.
 
-Alert on failed/rejected Task rates, lease-loss events, Outbox backlog age, repeated publish attempts, expired Registry membership, JVM saturation, and PostgreSQL connection pressure.
+Alert on failed/rejected Task rates, admission rejection, lease-loss events, Outbox backlog age, DLQ growth, repeated publish attempts, expired Registry membership, JVM saturation, and PostgreSQL connection pressure.
 
 ## Shutdown and recovery
 
@@ -54,11 +61,10 @@ Use graceful HTTP shutdown and a termination grace period longer than the longes
 
 ## Known gaps
 
-- No multi-region consensus or active-active database strategy.
-- Scope authorization is not tenant-aware ABAC/RBAC.
+- No multi-primary consensus or active-active writable database strategy; regional routing is fenced single-writer per tenant.
 - No durable A2A push-notification subscription service.
-- No built-in broker provisioning, schema registry, or dead-letter administration.
-- No chaos/soak SLO evidence yet.
-- No management UI, quotas, or admission controller.
+- No built-in broker provisioning, schema registry, or automated dead-letter redrive policy; replay is an explicit administrator action.
+- No published long-duration chaos/soak SLO evidence yet; executable k6 and Toxiproxy baselines are included.
+- No management UI; tenant policy and DLQ operations are API-driven.
 
 These boundaries make the project suitable for controlled production pilots and further framework development, not a claim of turnkey enterprise platform maturity.

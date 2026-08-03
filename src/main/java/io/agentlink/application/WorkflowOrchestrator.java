@@ -44,6 +44,7 @@ public class WorkflowOrchestrator {
     private final String instanceId;
     private final Duration leaseTtl;
     private final AgentLinkTelemetry telemetry;
+    private final TenantControlPlane tenantControlPlane;
     private final Counter workflowCreated;
     private final Counter taskCompleted;
     private final Counter taskFailed;
@@ -59,6 +60,7 @@ public class WorkflowOrchestrator {
             MeterRegistry meterRegistry,
             WorkflowLeaseManager leaseManager,
             AgentLinkTelemetry telemetry,
+            TenantControlPlane tenantControlPlane,
             @Value("${agentlink.cluster.instance-id:${random.uuid}}") String instanceId,
             @Value("${agentlink.cluster.workflow-lease-ttl:PT30S}") Duration leaseTtl
     ) {
@@ -72,6 +74,7 @@ public class WorkflowOrchestrator {
         this.instanceId = instanceId;
         this.leaseTtl = leaseTtl;
         this.telemetry = telemetry;
+        this.tenantControlPlane = tenantControlPlane;
         this.workflowCreated = meterRegistry.counter("agentlink.workflows.created");
         this.taskCompleted = meterRegistry.counter("agentlink.task.completed");
         this.taskFailed = meterRegistry.counter("agentlink.task.failed");
@@ -83,18 +86,39 @@ public class WorkflowOrchestrator {
         String contextId = command.contextId() == null || command.contextId().isBlank()
                 ? UUID.randomUUID().toString()
                 : command.contextId();
-        Workflow workflow = new Workflow(contextId, command.goal(), command.nodes());
-        Workflow stored = store.saveIfAbsent(workflow);
+        tenantControlPlane.policyForWrite(command.tenantId());
+        Workflow existing = store.findForTenant(command.tenantId(), contextId).orElse(null);
+        if (existing != null) {
+            if (existing.sameDefinition(command.goal(), command.nodes())) {
+                return WorkflowView.from(existing);
+            }
+            throw new IllegalArgumentException("contextId already exists with a different workflow definition");
+        }
+        long routingEpoch = tenantControlPlane.admitWorkflow(command.tenantId(), contextId);
+        Workflow workflow = new Workflow(
+                command.tenantId(), routingEpoch, contextId, command.goal(), command.nodes()
+        );
+        Workflow stored;
+        try {
+            stored = store.saveIfAbsent(workflow);
+        } catch (RuntimeException failure) {
+            tenantControlPlane.releaseWorkflow(command.tenantId(), contextId);
+            throw failure;
+        }
         if (stored != workflow) {
-            if (stored.sameDefinition(command.goal(), command.nodes())) {
+            if (stored.tenantId().equals(command.tenantId())
+                    && stored.sameDefinition(command.goal(), command.nodes())) {
                 return WorkflowView.from(stored);
+            }
+            if (!stored.tenantId().equals(command.tenantId())) {
+                tenantControlPlane.releaseWorkflow(command.tenantId(), contextId);
             }
             throw new IllegalArgumentException("contextId already exists with a different workflow definition");
         }
         WorkflowLease lease = leaseManager.acquire(contextId, instanceId, leaseTtl)
                 .orElseThrow(() -> new WorkflowLeaseUnavailableException(contextId));
         activeLeases.put(contextId, lease);
-        telemetry.startWorkflow(contextId, workflow.goal(), workflow.tasks().size());
+        telemetry.startWorkflow(workflow.tenantId(), contextId, workflow.goal(), workflow.tasks().size());
         workflow.tasks().forEach(task -> publish(task, "task submitted"));
         workflowCreated.increment();
         activeWorkflows.put(contextId, workflow);
@@ -107,8 +131,18 @@ public class WorkflowOrchestrator {
                 .orElseThrow(() -> new WorkflowNotFoundException(contextId));
     }
 
+    public WorkflowView get(String tenantId, String contextId) {
+        return store.findForTenant(tenantId, contextId).map(WorkflowView::from)
+                .orElseThrow(() -> new WorkflowNotFoundException(contextId));
+    }
+
     public WorkflowView getByTaskId(String taskId) {
         return store.findByTaskId(taskId).map(WorkflowView::from)
+                .orElseThrow(() -> new WorkflowNotFoundException(taskId));
+    }
+
+    public WorkflowView getByTaskId(String tenantId, String taskId) {
+        return store.findByTaskIdForTenant(tenantId, taskId).map(WorkflowView::from)
                 .orElseThrow(() -> new WorkflowNotFoundException(taskId));
     }
 
@@ -119,6 +153,23 @@ public class WorkflowOrchestrator {
                 .orElseGet(() -> store.findByTaskId(taskId)
                         .orElseThrow(() -> new WorkflowNotFoundException(taskId)));
         return cancel(workflow.contextId());
+    }
+
+    public WorkflowView cancelByTaskId(String tenantId, String taskId) {
+        Workflow workflow = store.findByTaskIdForTenant(tenantId, taskId)
+                .orElseThrow(() -> new WorkflowNotFoundException(taskId));
+        return cancel(tenantId, workflow.contextId());
+    }
+
+    public WorkflowView cancel(String tenantId, String contextId) {
+        Workflow active = activeWorkflows.get(contextId);
+        if (active != null && !active.tenantId().equals(tenantId)) {
+            throw new WorkflowNotFoundException(contextId);
+        }
+        if (active == null && store.findForTenant(tenantId, contextId).isEmpty()) {
+            throw new WorkflowNotFoundException(contextId);
+        }
+        return cancel(contextId);
     }
 
     public WorkflowView cancel(String contextId) {
@@ -198,8 +249,9 @@ public class WorkflowOrchestrator {
     ) {
         String preferredAgentId = task.spec().metadata().get("agentId");
         AgentCard agent = (preferredAgentId == null
-                ? directory.select(task.spec().skill())
-                : directory.findById(preferredAgentId).filter(candidate -> candidate.supports(task.spec().skill())))
+                ? directory.select(workflow.tenantId(), task.spec().skill())
+                : directory.findById(workflow.tenantId(), preferredAgentId)
+                        .filter(candidate -> candidate.supports(task.spec().skill())))
                 .orElseThrow(() -> new IllegalStateException("no healthy agent supports skill: " + task.spec().skill()));
 
         task.assign(agent.id());
@@ -254,9 +306,17 @@ public class WorkflowOrchestrator {
 
     private void publish(AgentTask task, String message) {
         eventBus.publish(new TaskEvent(
-                0L, task.contextId(), task.id(), task.spec().nodeId(), task.state(), message,
+                0L, workflowTenant(task.contextId()), task.contextId(), task.id(), task.spec().nodeId(), task.state(), message,
                 task.artifact() == null ? null : task.artifact().id(), Instant.now()
         ));
+    }
+
+    private String workflowTenant(String contextId) {
+        Workflow active = activeWorkflows.get(contextId);
+        if (active != null) {
+            return active.tenantId();
+        }
+        return store.find(contextId).map(Workflow::tenantId).orElse("_default");
     }
 
     private void persist(Workflow workflow) {
@@ -274,7 +334,15 @@ public class WorkflowOrchestrator {
     public void renewLeases() {
         activeLeases.forEach((contextId, lease) -> leaseManager.renew(lease, leaseTtl)
                 .ifPresentOrElse(
-                        renewed -> activeLeases.replace(contextId, lease, renewed),
+                        renewed -> {
+                            activeLeases.replace(contextId, lease, renewed);
+                            Workflow workflow = activeWorkflows.get(contextId);
+                            if (workflow != null) {
+                                tenantControlPlane.renewWorkflow(
+                                        workflow.tenantId(), workflow.contextId(), leaseTtl.multipliedBy(2)
+                                );
+                            }
+                        },
                         () -> abandonWorkflow(contextId, lease)
                 ));
     }
@@ -299,10 +367,13 @@ public class WorkflowOrchestrator {
     }
 
     private void releaseWorkflow(Workflow workflow) {
-        activeWorkflows.remove(workflow.contextId(), workflow);
+        boolean wasActive = activeWorkflows.remove(workflow.contextId(), workflow);
         WorkflowLease lease = activeLeases.remove(workflow.contextId());
         if (lease != null) {
             leaseManager.release(lease);
+        }
+        if (wasActive || workflow.tasks().stream().allMatch(task -> task.state().terminal())) {
+            tenantControlPlane.releaseWorkflow(workflow.tenantId(), workflow.contextId());
         }
         telemetry.endWorkflow(workflow.contextId(), workflowOutcome(workflow));
     }

@@ -26,6 +26,7 @@ management:
         enabled: true
 
 agentlink:
+  region: ${AGENTLINK_REGION:local}
   persistence:
     mode: ${AGENTLINK_PERSISTENCE_MODE:memory}
     fail-interrupted-on-startup: true
@@ -38,6 +39,16 @@ agentlink:
   outbox:
     poll-interval: 1000
     claim-ttl: PT30S
+    max-attempts: 8
+    initial-backoff: PT1S
+    max-backoff: PT5M
+  tenancy:
+    default-requests-per-minute: 600
+    default-workflows-per-day: 10000
+    default-max-active-workflows: 100
+    reservation-ttl: PT15M
+    rate-bucket-retention: P2D
+    maintenance-interval: 3600000
   cluster:
     instance-id: ${AGENTLINK_INSTANCE_ID:${random.uuid}}
     workflow-lease-ttl: PT30S
@@ -55,6 +66,8 @@ agentlink:
     max-artifact-chars: 100000
   security:
     mode: ${AGENTLINK_SECURITY_MODE:permit-all}
+    tenant-claim: ${AGENTLINK_TENANT_CLAIM:tenant_id}
+    default-tenant: ${AGENTLINK_DEFAULT_TENANT:_default}
     allow-private-agent-networks: ${AGENTLINK_ALLOW_PRIVATE:false}
   a2a:
     public-base-url: ${AGENTLINK_PUBLIC_BASE_URL:http://localhost:8096}
